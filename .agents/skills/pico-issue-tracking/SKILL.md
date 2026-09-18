@@ -7,7 +7,7 @@ description: Implement and track PicoDataLogger GitHub lesson issues in small, l
 
 Use the GitHub lesson issue as the scope and learning contract for implementation work. Follow `AGENTS.md` and preserve the wiring in `README.md`.
 
-Maintain one authoritative issue comment containing `<!-- pico-data-logger-issue-tracker -->`. A request to start, implement, continue, review, or report progress on an issue authorizes creating or updating that tracker comment. It does not authorize closing the issue or rewriting its curriculum body.
+Maintain one authoritative issue comment containing `<!-- pico-data-logger-issue-tracker -->`. A request to start, implement, continue, review, or report progress on an issue authorizes creating or updating that tracker comment and synchronizing verified checkbox states in the issue body. Preserve the body's wording, ordering, and scope; checkbox synchronization is not permission to rewrite the curriculum or close the issue.
 
 ## Start or resume an issue
 
@@ -15,7 +15,7 @@ Maintain one authoritative issue comment containing `<!-- pico-data-logger-issue
 2. Inspect the current repository and relevant upstream documentation. Check dependency issues rather than assuming their state from links alone.
 3. Find the comment containing the tracker marker. Reuse it if present; never create a second authoritative tracker.
 4. Build or refresh a tracker covering the whole issue while keeping the user's requested slice as the current position.
-5. Mark existing work complete only when repository or hardware evidence supports it.
+5. Mark existing work complete only when repository or hardware evidence supports it. Synchronize any matching issue-body checkbox without changing its text.
 
 Use this tracker shape:
 
@@ -51,7 +51,8 @@ Keep tasks small enough to review individually. Preserve the issue's intended be
 4. Run formatting, focused tests, cross-builds, or static checks proportional to the change.
 5. Review the resulting diff for scope, secrets, pin assignments, fixed-memory assumptions, and accidental desktop-only dependencies.
 6. Edit the existing tracker comment: check only verified work, record concise evidence beside the relevant item when useful, and move `Current position` to the next actionable step.
-7. Return the direct issue or tracker-comment link, what changed, verification performed, the next learning step, and any hardware observation still needed from the user.
+7. Update matching checkboxes in the issue body to the same verified state. Preserve every heading and checklist sentence verbatim. Do not check optional or learner-owned items unless the corresponding work or answer has actually been provided.
+8. Return the direct issue or tracker-comment link, what changed, verification performed, the next learning step, and any hardware observation still needed from the user.
 
 Use explanations to connect the change to Rust ownership, traits, `Result`, async execution, static memory, I2C, networking, or MQTT as relevant. Keep those explanations focused on code the learner can currently see.
 
@@ -62,14 +63,16 @@ When asked to review work or report progress:
 1. Treat the tracker as an index, not proof.
 2. Inspect the implementation, diff, tests, and required hardware evidence.
 3. Report concrete defects before checking corresponding items.
-4. Update the same tracker only when evidence changes its state.
-5. Keep incomplete, failing, stubbed, untested, and learner-owned reflection items unchecked.
-6. If nothing newly qualifies, leave the tracker unchanged and explain why.
+4. Update the same tracker only when evidence changes its state, then synchronize matching issue-body checkboxes.
+5. Keep incomplete, failing, stubbed, untested, and learner-owned reflection items unchecked in both places.
+6. Preserve issue-body prose exactly; only change `[ ]` and `[x]` markers for matching verified items.
+7. If nothing newly qualifies, leave the tracker and issue body unchanged and explain why.
 
 ## Completion boundaries
 
 - A successful cross-build does not prove USB, Wi-Fi, I2C, sensor, or MQTT behavior on the physical device.
 - User-reported serial output or broker observations may satisfy a manual checkpoint; summarize that evidence in the tracker.
 - Never mark an explain-it-back item complete on the learner's behalf.
+- Treat the tracker as the detailed evidence record and the issue body as the concise learner-facing progress view; keep their matching items consistent.
 - Never expose Wi-Fi or MQTT credentials in issue comments, logs, commands, or committed files.
 - Do not close the issue automatically. When every implementation and verification item is complete, report that it is ready to close and identify any remaining learning checks separately.
