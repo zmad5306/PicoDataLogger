@@ -10,6 +10,8 @@ cortex-m-rt = "0.7"
 
 embassy-executor = "0.10"
 embassy-time = "0.5"
+panic-halt = "1.0"
+
 [dependencies.embassy-rp]
 version = "0.10"
 features = [
@@ -18,8 +20,6 @@ features = [
     "critical-section-impl",
     "executor-thread",
 ]
-
-panic-halt = "1.0"
 
 [profile.release]
 codegen-units = 1
