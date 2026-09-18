@@ -10,4 +10,4 @@ Preserve the hardware configuration documented in `README.md`: the SHT40 uses 3V
 
 When the user asks to start, implement part of, continue, review, or report progress on a GitHub lesson issue, use the repository-local `pico-issue-tracking` skill.
 
-Maintain one authoritative tracker comment per issue. Update only items supported by repository, test, build, or hardware evidence. Keep learner reflection questions unchecked until the user answers them. Do not close an issue or alter its curriculum body unless the user explicitly requests that action.
+Maintain one authoritative tracker comment per issue. Update only items supported by repository, test, build, or hardware evidence, and synchronize the matching checkboxes in the issue body so the learner-facing roadmap stays current. Preserve the issue's wording and structure. Keep learner reflection questions unchecked until the user answers them, and do not close an issue unless the user explicitly requests that action.
