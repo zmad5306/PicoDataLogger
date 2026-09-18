@@ -1,0 +1,28 @@
+[package]
+name = "pico-data-logger"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+
+embassy-executor = "0.10"
+embassy-time = "0.5"
+[dependencies.embassy-rp]
+version = "0.10"
+features = [
+    "rp235xa",
+    "time-driver",
+    "critical-section-impl",
+    "executor-thread",
+]
+
+panic-halt = "1.0"
+
+[profile.release]
+codegen-units = 1
+debug = 2
+lto = "fat"
+opt-level = "s"
