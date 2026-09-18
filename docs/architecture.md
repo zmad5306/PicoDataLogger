@@ -30,27 +30,41 @@ There is no operating system providing services such as files, processes, socket
 
 ## 2. Embassy Stack
 
-PicoDataLogger uses Embassy to provide an asynchronous programming model on top of the RP2350 hardware without requiring an operating system.
+PicoDataLogger uses Embassy to provide an asynchronous programming model on top of the RP2350A hardware without requiring an operating system.
+
+The RP2350A provides:
+
+- **2 × Arm Cortex-M33 cores** running at up to **150 MHz**
+- Hardware single-precision floating point and DSP instructions
+- **520 kB of on-chip SRAM** across 10 independent banks
+- **8 kB of one-time-programmable (OTP) storage**
+- No internal flash; program storage is provided by external QSPI flash
+
+On the Pico 2 W, the RP2350A is paired with **4 MB of external QSPI flash**.
 
 ```mermaid
 flowchart TD
     APP["Application<br/>tasks and application logic"]
     EXEC["Embassy Executor<br/>async task scheduling"]
     HAL["embassy-rp HAL<br/>GPIO / I2C / SPI / UART / DMA / Timers"]
-    HW["RP2350 Hardware<br/>CPU / RAM / GPIO / I2C / SPI / UART / DMA / Timers"]
+    HW["RP2350A Hardware<br/>2 × Cortex-M33 @ 150 MHz<br/>520 kB SRAM<br/>Peripherals"]
+    FLASH["External QSPI Flash<br/>4 MB on Pico 2 W"]
 
     APP --> EXEC
     EXEC --> HAL
     HAL --> HW
+    HW <--> FLASH
 ```
 
 The **application** contains the device's behavior and asynchronous tasks.
 
 The **Embassy executor** runs those async tasks, wakes them when events occur, and can allow the CPU to sleep when no task has work to perform.
 
-The **`embassy-rp` HAL** exposes Rust APIs for configuring and controlling RP2350 hardware such as GPIO, I2C, SPI, timers, and DMA.
+The **`embassy-rp` HAL** exposes Rust APIs for configuring and controlling RP2350A hardware such as GPIO, I2C, SPI, timers, and DMA.
 
-At the bottom is the **RP2350 hardware** itself. HAL operations ultimately become CPU instructions that read and write memory-mapped hardware registers.
+At the bottom is the **RP2350A hardware** itself. The chip contains two Arm Cortex-M33 CPU cores, 520 kB of SRAM, and the hardware peripherals controlled by the HAL. HAL operations ultimately become CPU instructions that read and write memory-mapped hardware registers.
+
+The RP2350A does not contain flash memory. The Pico 2 W board provides **4 MB of external QSPI flash**, which stores the firmware image and other nonvolatile data.
 
 ---
 
