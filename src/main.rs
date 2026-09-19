@@ -89,6 +89,11 @@ async fn cyw43_task(
     runner.run().await;
 }
 
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
+    runner.run().await;
+}
+
 #[embassy_executor::main(
     executor = "embassy_rp::executor::Executor",
     entry = "cortex_m_rt::entry"
@@ -120,12 +125,25 @@ async fn main(spawner: Spawner) {
     );
 
     static CYW43_STATE: StaticCell<cyw43::State> = StaticCell::new();
+    static NETWORK_RESOURCES: StaticCell<embassy_net::StackResources<3>> = StaticCell::new();
 
     let state = CYW43_STATE.init(cyw43::State::new());
 
-    let (_net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
+    let mut rng = embassy_rp::clocks::RoscRng;
+    let seed = rng.next_u64();
+
+    let net_config = embassy_net::Config::dhcpv4(Default::default());
+
+    let (stack, net_runner) = embassy_net::new(
+        net_device,
+        net_config,
+        NETWORK_RESOURCES.init(embassy_net::StackResources::new()),
+        seed,
+    );
 
     spawner.spawn(cyw43_task(runner).expect("Failed to start CYW43 runner task"));
+    spawner.spawn(net_task(net_runner).expect("Failed to start network runner task"));
 
     control.init(clm).await;
 
@@ -172,6 +190,27 @@ async fn main(spawner: Spawner) {
                 log::info!("retrying Wi-Fi join in 5 seconds");
                 Timer::after_secs(5).await;
             }
+        }
+    }
+
+    log::info!("waiting for network link");
+    stack.wait_link_up().await;
+    log::info!("network link up; waiting for DHCP");
+
+    stack.wait_config_up().await;
+
+    match stack.config_v4() {
+        Some(ipv4_config) => {
+            log::info!(
+                "DHCP configured: address={:?}/{} gateway={:?} dns={:?}",
+                ipv4_config.address,
+                ipv4_config.address.prefix_len(),
+                ipv4_config.gateway,
+                ipv4_config.dns_servers.as_slice()
+            );
+        }
+        None => {
+            log::error!("network configuration became ready without IPv4 configuration");
         }
     }
 
