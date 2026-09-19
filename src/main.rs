@@ -16,10 +16,10 @@ use panic_halt as _;
 use pico_data_logger::ntp::{
     NTP_PACKET_LEN, build_ntp_request, ntp_to_unix_seconds, validate_ntp_response,
 };
+use sht4x::Sht4xAsync;
 use static_cell::StaticCell;
 
 const NTP_PORT: u16 = 123;
-const SHT40_ADDRESS: u16 = 0x44;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -369,24 +369,14 @@ async fn main(spawner: Spawner) {
     i2c_config.sda_pullup = false;
     i2c_config.scl_pullup = false;
 
-    let mut i2c = I2c::new_async(
+    let i2c = I2c::new_async(
         p.I2C0, p.PIN_1, // SCL
         p.PIN_0, // SDA
         Irqs, i2c_config,
     );
 
-    match i2c.write_async(SHT40_ADDRESS, [0x94]).await {
-        Ok(()) => {
-            log::info!("SHT40 found at 0x{:02x}", SHT40_ADDRESS);
-        }
-        Err(error) => {
-            log::error!(
-                "Failed to find SHT40 at 0x{:02x}: {:?}. Check sensor power, SDA/SCL wiring, address, and connector",
-                SHT40_ADDRESS,
-                error
-            );
-        }
-    }
+    let mut sht40 = Sht4xAsync::<_, embassy_time::Delay>::new(i2c);
+    let mut delay = embassy_time::Delay;
 
     let fw = aligned_bytes!("../firmware/43439A0.bin");
     let clm = aligned_bytes!("../firmware/43439A0_clm.bin");
@@ -442,6 +432,21 @@ async fn main(spawner: Spawner) {
     Timer::after_secs(2).await;
 
     log::info!("Pico Data Logger v{} starting", env!("CARGO_PKG_VERSION"));
+
+    match sht40.serial_number(&mut delay).await {
+        Ok(serial) => {
+            log::info!("SHT40 serial number: 0x{:08X}", serial);
+        }
+        Err(sht4x::Error::I2c(error)) => {
+            log::error!("SHT40 I2C error: {:?}", error);
+        }
+        Err(sht4x::Error::Crc) => {
+            log::error!("SHT40 serial number failed CRC validation");
+        }
+        Err(error) => {
+            log::error!("Unexpected SHT40 error: {:?}", error);
+        }
+    }
 
     let config = match AppConfig::load() {
         Ok(config) => config,
