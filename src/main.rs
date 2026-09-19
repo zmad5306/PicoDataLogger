@@ -133,7 +133,7 @@ async fn main(spawner: Spawner) {
         .set_power_management(cyw43::PowerManagementMode::PowerSave)
         .await;
 
-    log::info!("CYW43439 initialized in PowerSave mode");
+    log::info!("radio ready: CYW43439 initialized in PowerSave mode");
 
     let started_at = Instant::now();
 
@@ -141,7 +141,7 @@ async fn main(spawner: Spawner) {
 
     log::info!("Pico Data Logger v{} starting", env!("CARGO_PKG_VERSION"));
 
-    let _config = match AppConfig::load() {
+    let config = match AppConfig::load() {
         Ok(config) => config,
         Err(error) => {
             log::error!("invalid application configuration: {:?}", error);
@@ -153,11 +153,37 @@ async fn main(spawner: Spawner) {
     };
 
     loop {
+        let mut join_options = cyw43::JoinOptions::new(config.wifi_password.as_bytes());
+        join_options.auth = cyw43::JoinAuth::Wpa2;
+
+        log::info!("joining WiFi network: {}", config.wifi_ssid);
+
+        match control.join(config.wifi_ssid, join_options).await {
+            Ok(()) => {
+                log::info!("joined Wi-Fi network: {}", config.wifi_ssid);
+                break;
+            }
+            Err(error) => {
+                log::error!(
+                    "join failed for Wi-Fi network {}: {:?}",
+                    config.wifi_ssid,
+                    error
+                );
+                log::info!("retrying Wi-Fi join in 5 seconds");
+                Timer::after_secs(5).await;
+            }
+        }
+    }
+
+    loop {
         log::info!("uptime: {} seconds; LED on", started_at.elapsed().as_secs());
         control.gpio_set(0, true).await;
         Timer::after_secs(1).await;
 
-        log::info!("uptime: {} seconds; LED off", started_at.elapsed().as_secs());
+        log::info!(
+            "uptime: {} seconds; LED off",
+            started_at.elapsed().as_secs()
+        );
         control.gpio_set(0, false).await;
         Timer::after_secs(1).await;
     }
