@@ -534,8 +534,21 @@ async fn main(spawner: Spawner) {
     };
 
     loop {
-        log::info!("current UTC: unix_seconds={}", clock_anchor.unix_now().unwrap_or(0));
+        let unix_seconds = match clock_anchor.unix_now() {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!(
+                    "clock arithmetic failed {:?}; operation remains blocked",
+                    error
+                );
+                Timer::after_secs(5).await;
+                continue;
+            }
+        };
+
+        log::info!("current UTC: unix_seconds={}", unix_seconds);
         log::info!("uptime: {} seconds; LED on", started_at.elapsed().as_secs());
+
         control.gpio_set(0, true).await;
         Timer::after_secs(1).await;
 
@@ -543,7 +556,9 @@ async fn main(spawner: Spawner) {
             "uptime: {} seconds; LED off",
             started_at.elapsed().as_secs()
         );
+
         control.gpio_set(0, false).await;
+
         Timer::after_secs(1).await;
     }
 }
