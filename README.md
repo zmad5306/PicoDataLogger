@@ -41,6 +41,50 @@ elf2uf2-rs convert --help
 
 Do not use an older converter that only accepts an input and output path. Those versions default to the RP2040 UF2 family, which the RP2350 bootloader ignores.
 
+### Compile-time application configuration
+
+Set the required values in PowerShell 7 before building or running the deployment script:
+
+```powershell
+$env:WIFI_SSID = "your-network-name"
+$env:WIFI_PASSWORD = "your-network-password"
+$env:MQTT_HOST = "broker.example.com"
+```
+
+The remaining settings are optional:
+
+```powershell
+$env:MQTT_PORT = "1883"
+$env:MQTT_TOPIC = "pico-data-logger/readings"
+$env:MQTT_CLIENT_ID = "pico-data-logger"
+$env:MQTT_USERNAME = "your-mqtt-username"
+$env:MQTT_PASSWORD = "your-mqtt-password"
+```
+
+In Bash or Zsh, export the same values before building or running the macOS deployment script:
+
+```bash
+export WIFI_SSID="your-network-name"
+export WIFI_PASSWORD="your-network-password"
+export MQTT_HOST="broker.example.com"
+
+export MQTT_PORT="1883"
+export MQTT_TOPIC="pico-data-logger/readings"
+export MQTT_CLIENT_ID="pico-data-logger"
+export MQTT_USERNAME="your-mqtt-username"
+export MQTT_PASSWORD="your-mqtt-password"
+```
+
+For anonymous MQTT, ensure both optional credentials are absent:
+
+```bash
+unset MQTT_USERNAME MQTT_PASSWORD
+```
+
+`MQTT_USERNAME` and `MQTT_PASSWORD` must either both be set or both be absent. The optional settings use their documented defaults when omitted.
+
+These values are read by `option_env!` during compilation. They are embedded in the resulting firmware binary, so compile-time configuration prevents accidental source-control commits but does not make credentials secret from someone who obtains the binary. Do not commit real credentials or generated firmware containing them.
+
 ### Automated build and flash
 
 With the Pico mounted in BOOTSEL mode, use the script for your development machine.
