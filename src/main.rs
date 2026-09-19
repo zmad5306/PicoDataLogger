@@ -381,7 +381,7 @@ async fn main(spawner: Spawner) {
         }
         Err(error) => {
             log::error!(
-                "Failed to find SHT40 at 0x{:02x}: {:?}",
+                "Failed to find SHT40 at 0x{:02x}: {:?}. Check sensor power, SDA/SCL wiring, address, and connector",
                 SHT40_ADDRESS,
                 error
             );
