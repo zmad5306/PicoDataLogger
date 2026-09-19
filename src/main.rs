@@ -10,7 +10,7 @@ use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
-use embassy_time::{Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use panic_halt as _;
 use static_cell::StaticCell;
 
@@ -21,6 +21,10 @@ bind_interrupts!(struct Irqs {
 });
 
 type UsbDriver = Driver<'static, USB>;
+
+const NTP_PACKET_LEN: usize = 48;
+const NTP_PORT: u16 = 123;
+const NTP_UNIX_EPOCH_OFFSET_SECONDS: u64 = 2_208_988_800;
 
 struct AppConfig {
     wifi_ssid: &'static str,
@@ -34,6 +38,16 @@ struct AppConfig {
     ntp_host: &'static str,
 }
 
+struct ClockAnchor {
+    unix_seconds: u64,
+    monotonic: Instant,
+}
+
+#[derive(Debug)]
+enum ClockError {
+    Overflow,
+}
+
 #[derive(Debug)]
 enum ConfigError {
     MissingWifiSsid,
@@ -41,6 +55,15 @@ enum ConfigError {
     MissingMqttHost,
     InvalidMqttPort,
     IncompleteMqttCredentials,
+}
+
+#[derive(Debug)]
+enum NtpValidationError {
+    TooShort,
+    InvalidServerMode,
+    UnsynchronizedServer,
+    InvalidStratum,
+    RequestTimestampMismatch,
 }
 
 #[derive(Debug)]
@@ -65,6 +88,14 @@ impl ResolveError {
                 log::error!("DNS returned no IPv4 addresses for {}", hostname);
             }
         }
+    }
+}
+
+impl ClockAnchor {
+    fn unix_now(&self) -> Result<u64, ClockError> {
+        self.unix_seconds
+            .checked_add(self.monotonic.elapsed().as_secs())
+            .ok_or(ClockError::Overflow)
     }
 }
 
@@ -223,6 +254,176 @@ async fn resolve_ipv4(
     Err(last_error.unwrap_or(ResolveError::NoAddresses))
 }
 
+fn build_ntp_request(request_id: u64) -> [u8; NTP_PACKET_LEN] {
+    let mut packet = [0_u8; NTP_PACKET_LEN];
+
+    // LI = 0 (00): no leap-second warning.
+    // VN = 4 (100): NTP version 4.
+    // Mode = 3 (011): client request.
+
+    // 00_100_011 = 0010_0011 = 0x23
+
+    packet[0] = 0x23;
+    packet[40..48].copy_from_slice(&request_id.to_be_bytes());
+
+    packet
+}
+
+fn validate_ntp_response(response: &[u8], request_id: u64) -> Result<(), NtpValidationError> {
+    if response.len() < NTP_PACKET_LEN {
+        return Err(NtpValidationError::TooShort);
+    }
+
+    // First byte layout: [LI: bits 7-6] [VN: bits 5-3] [Mode: bits 2-0].
+    // Mask off LI and VN, leaving only the three-bit mode.
+    let mode = response[0] & 0b0000_0111;
+
+    if mode != 4 {
+        return Err(NtpValidationError::InvalidServerMode);
+    }
+
+    // Shift away VN and Mode, leaving the two-bit leap indicator.
+    let leap_indicator = response[0] >> 6;
+
+    // Leap-indicator values:
+    // - 0: no warning
+    // - 1: the current day will contain an added leap second
+    // - 2: the current day will omit a leap second
+    // - 3: the server clock is unsynchronized—reject its time
+
+    if leap_indicator == 3 {
+        return Err(NtpValidationError::UnsynchronizedServer);
+    }
+
+    // Stratum 1-15 identifies a synchronized primary or secondary time source.
+    // Stratum 0 is a control/Kiss-o'-Death response; values above 15 are invalid.
+    let stratum = response[1];
+
+    if stratum == 0 || stratum > 15 {
+        return Err(NtpValidationError::InvalidStratum);
+    }
+
+    // An NTP server copies the client's transmit timestamp (request bytes 40..48)
+    // into the response's originate timestamp field (response bytes 24..32).
+    let expected_originate = request_id.to_be_bytes();
+    let actual_originate = &response[24..32];
+
+    if actual_originate != expected_originate.as_slice() {
+        return Err(NtpValidationError::RequestTimestampMismatch);
+    }
+
+    Ok(())
+}
+
+fn ntp_to_unix_seconds(ntp_seconds: u32) -> Option<u64> {
+    u64::from(ntp_seconds).checked_sub(NTP_UNIX_EPOCH_OFFSET_SECONDS)
+}
+
+async fn synchronize_clock(
+    stack: embassy_net::Stack<'_>,
+    server_address: embassy_net::IpAddress,
+    request_id: u64,
+) -> Option<ClockAnchor> {
+    let mut clock_anchor = None;
+    let mut ntp_rx_meta = [embassy_net::udp::PacketMetadata::EMPTY; 1];
+    let mut ntp_rx_buffer = [0_u8; 512];
+    let mut ntp_tx_meta = [embassy_net::udp::PacketMetadata::EMPTY; 1];
+    let mut ntp_tx_buffer = [0_u8; NTP_PACKET_LEN];
+
+    let mut ntp_socket = embassy_net::udp::UdpSocket::new(
+        stack,
+        &mut ntp_rx_meta,
+        &mut ntp_rx_buffer,
+        &mut ntp_tx_meta,
+        &mut ntp_tx_buffer,
+    );
+
+    match ntp_socket.bind(0) {
+        Ok(()) => {
+            log::info!("NTP UDP socket bound");
+
+            let ntp_request = build_ntp_request(request_id);
+
+            let endpoint = embassy_net::IpEndpoint::new(server_address, NTP_PORT);
+
+            match ntp_socket.send_to(&ntp_request, endpoint).await {
+                Ok(()) => {
+                    log::info!("sent {}-byte NTP request", ntp_request.len());
+
+                    let mut response = [0_u8; 512];
+
+                    match with_timeout(Duration::from_secs(5), ntp_socket.recv_from(&mut response))
+                        .await
+                    {
+                        Ok(Ok((length, metadata))) => {
+                            log::info!(
+                                "received {}-byte NTP response from {:?}",
+                                length,
+                                metadata.endpoint
+                            );
+
+                            match validate_ntp_response(&response[..length], request_id) {
+                                Ok(()) => {
+                                    let ntp_seconds = u32::from_be_bytes([
+                                        response[40],
+                                        response[41],
+                                        response[42],
+                                        response[43],
+                                    ]);
+
+                                    match ntp_to_unix_seconds(ntp_seconds) {
+                                        Some(unix_seconds) => {
+                                            log::info!(
+                                                "NTP response passed validation: unix_seconds={}",
+                                                unix_seconds
+                                            );
+
+                                            let anchor = ClockAnchor {
+                                                unix_seconds,
+                                                monotonic: Instant::now(),
+                                            };
+
+                                            log::info!(
+                                                "clock anchored: unix_seconds={} monotonic_ticks={}",
+                                                anchor.unix_seconds,
+                                                anchor.monotonic.as_ticks()
+                                            );
+
+                                            clock_anchor = Some(anchor);
+                                        }
+                                        None => {
+                                            log::error!(
+                                                "rejected NTP timestamp before the Unix epoch"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    log::error!("rejected NTP response {:?}", error)
+                                }
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            log::error!("failed to receive NTP response: {:?}", error);
+                        }
+                        Err(_) => {
+                            log::error!("timed out waiting for NTP response");
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::error!("failed to send NTP request: {:?}", error);
+                }
+            }
+        }
+        Err(error) => {
+            log::error!("failed to bind NTP UDP socket: {:?}", error);
+        }
+    }
+
+    clock_anchor
+}
+
 #[embassy_executor::main(
     executor = "embassy_rp::executor::Executor",
     entry = "cortex_m_rt::entry"
@@ -254,7 +455,7 @@ async fn main(spawner: Spawner) {
     );
 
     static CYW43_STATE: StaticCell<cyw43::State> = StaticCell::new();
-    static NETWORK_RESOURCES: StaticCell<embassy_net::StackResources<3>> = StaticCell::new();
+    static NETWORK_RESOURCES: StaticCell<embassy_net::StackResources<4>> = StaticCell::new();
 
     let state = CYW43_STATE.init(cyw43::State::new());
 
@@ -312,18 +513,28 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    let _ntp_address = match resolve_ipv4(stack, config.ntp_host).await {
-        Ok(address) => {
-            log::info!("resolved NTP host {} to {:?}", config.ntp_host, address);
-            Some(address)
+    let clock_anchor = loop {
+        log::info!("attempting NTP synchronization");
+
+        match resolve_ipv4(stack, config.ntp_host).await {
+            Ok(address) => {
+                let request_id = rng.next_u64();
+
+                if let Some(anchor) = synchronize_clock(stack, address, request_id).await {
+                    break anchor;
+                }
+            }
+            Err(error) => {
+                error.log(config.ntp_host);
+            }
         }
-        Err(error) => {
-            error.log(config.ntp_host);
-            None
-        }
+
+        log::info!("time remains unsynchronized; retrying in 5 seconds");
+        Timer::after_secs(5).await;
     };
 
     loop {
+        log::info!("current UTC: unix_seconds={}", clock_anchor.unix_now().unwrap_or(0));
         log::info!("uptime: {} seconds; LED on", started_at.elapsed().as_secs());
         control.gpio_set(0, true).await;
         Timer::after_secs(1).await;
