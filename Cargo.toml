@@ -10,6 +10,10 @@ cortex-m-rt = "0.7"
 
 embassy-executor = "0.10"
 embassy-time = "0.5"
+embassy-usb = "0.6"
+embassy-usb-logger = "0.6"
+log = "0.4"
+static_cell = "2"
 panic-halt = "1.0"
 
 [dependencies.embassy-rp]
