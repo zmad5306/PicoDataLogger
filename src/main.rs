@@ -11,12 +11,12 @@ use embassy_rp::i2c::{Config as I2cConfig, I2c, InterruptHandler as I2cInterrupt
 use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
-use embassy_time::{Duration, Instant, Timer, with_timeout};
+use embassy_time::{Duration, Instant, Ticker, Timer, with_timeout};
 use panic_halt as _;
 use pico_data_logger::ntp::{
     NTP_PACKET_LEN, build_ntp_request, ntp_to_unix_seconds, validate_ntp_response,
 };
-use sht4x::Sht4xAsync;
+use sht4x::{Precision, Sht4xAsync};
 use static_cell::StaticCell;
 
 const NTP_PORT: u16 = 123;
@@ -366,8 +366,8 @@ async fn main(spawner: Spawner) {
 
     let mut i2c_config = I2cConfig::default();
     i2c_config.frequency = 100_000; // 100 kHz
-    i2c_config.sda_pullup = false;
-    i2c_config.scl_pullup = false;
+    i2c_config.sda_pullup = true;
+    i2c_config.scl_pullup = true;
 
     let i2c = I2c::new_async(
         p.I2C0, p.PIN_1, // SCL
@@ -492,7 +492,38 @@ async fn main(spawner: Spawner) {
         Timer::after_secs(5).await;
     };
 
+    let mut measurement_ticker = Ticker::every(Duration::from_secs(10));
+    let mut consecutive_measurements = 0_u32;
+
     loop {
+        match sht40.measure(Precision::High, &mut delay).await {
+            Ok(measurement) => {
+                consecutive_measurements = consecutive_measurements.saturating_add(1);
+
+                let temperature = measurement.temperature_celsius();
+                let humidity = measurement.humidity_percent();
+
+                log::info!(
+                    "SHT40 measurement: temperature={:.2}°C, humidity={:.2}% RH consecutive={}",
+                    temperature,
+                    humidity,
+                    consecutive_measurements
+                );
+            }
+            Err(sht4x::Error::I2c(error)) => {
+                consecutive_measurements = 0;
+                log::error!("SHT40 measurement failed: I2C error {:?}", error);
+            }
+            Err(sht4x::Error::Crc) => {
+                consecutive_measurements = 0;
+                log::error!("SHT40 measurement failed: CRC error");
+            }
+            Err(error) => {
+                consecutive_measurements = 0;
+                log::error!("SHT40 measurement failed: {:?}", error);
+            }
+        };
+
         let unix_seconds = match clock_anchor.unix_now() {
             Ok(value) => value,
             Err(error) => {
@@ -518,6 +549,6 @@ async fn main(spawner: Spawner) {
 
         control.gpio_set(0, false).await;
 
-        Timer::after_secs(1).await;
+        measurement_ticker.next().await;
     }
 }
