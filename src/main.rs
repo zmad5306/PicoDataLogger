@@ -19,6 +19,7 @@ use pico_data_logger::ntp::{
 use static_cell::StaticCell;
 
 const NTP_PORT: u16 = 123;
+const SHT40_ADDRESS: u16 = 0x44;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -368,11 +369,24 @@ async fn main(spawner: Spawner) {
     i2c_config.sda_pullup = false;
     i2c_config.scl_pullup = false;
 
-    let _i2c = I2c::new_async(
+    let mut i2c = I2c::new_async(
         p.I2C0, p.PIN_1, // SCL
         p.PIN_0, // SDA
         Irqs, i2c_config,
     );
+
+    match i2c.write_async(SHT40_ADDRESS, [0x94]).await {
+        Ok(()) => {
+            log::info!("SHT40 found at 0x{:02x}", SHT40_ADDRESS);
+        }
+        Err(error) => {
+            log::error!(
+                "Failed to find SHT40 at 0x{:02x}: {:?}",
+                SHT40_ADDRESS,
+                error
+            );
+        }
+    }
 
     let fw = aligned_bytes!("../firmware/43439A0.bin");
     let clm = aligned_bytes!("../firmware/43439A0_clm.bin");
