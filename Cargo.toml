@@ -18,6 +18,7 @@ embassy-net = { version = "0.9", features = ["dhcpv4", "dns", "tcp", "udp"] }
 log = "0.4"
 static_cell = "2"
 panic-halt = "1.0"
+sht4x = { version = "0.2", features = ["embedded-hal-async"] }
 
 [dependencies.embassy-rp]
 version = "0.10"
