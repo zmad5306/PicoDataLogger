@@ -47,7 +47,15 @@ Do not use an older converter that only accepts an input and output path. Those 
 
 ### Compile-time application configuration
 
-Set the required values in PowerShell 7 before building or running the deployment script:
+Copy the ignored local environment-file template and replace its placeholders with your Wi-Fi and MQTT settings:
+
+```sh
+cp .env.example .env
+```
+
+Both deployment scripts automatically load `.env` from the repository root before compiling. The file is ignored by Git so local credentials are not committed. Do not remove `.env` from `.gitignore` or put real credentials in `.env.example`.
+
+Alternatively, set the required values in PowerShell 7 before building or running the deployment script:
 
 ```powershell
 $env:WIFI_SSID = "your-network-name"
