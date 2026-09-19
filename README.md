@@ -63,6 +63,7 @@ $env:MQTT_TOPIC = "pico-data-logger/readings"
 $env:MQTT_CLIENT_ID = "pico-data-logger"
 $env:MQTT_USERNAME = "your-mqtt-username"
 $env:MQTT_PASSWORD = "your-mqtt-password"
+$env:NTP_HOST = "pool.ntp.org"
 ```
 
 In Bash or Zsh, export the same values before building or running the macOS deployment script:
@@ -77,6 +78,7 @@ export MQTT_TOPIC="pico-data-logger/readings"
 export MQTT_CLIENT_ID="pico-data-logger"
 export MQTT_USERNAME="your-mqtt-username"
 export MQTT_PASSWORD="your-mqtt-password"
+export NTP_HOST="pool.ntp.org"
 ```
 
 For anonymous MQTT, ensure both optional credentials are absent:
@@ -86,6 +88,8 @@ unset MQTT_USERNAME MQTT_PASSWORD
 ```
 
 `MQTT_USERNAME` and `MQTT_PASSWORD` must either both be set or both be absent. The optional settings use their documented defaults when omitted.
+
+`NTP_HOST` uses its documented default when omitted.
 
 These values are read by `option_env!` during compilation. They are embedded in the resulting firmware binary, so compile-time configuration prevents accidental source-control commits but does not make credentials secret from someone who obtains the binary. Do not commit real credentials or generated firmware containing them.
 

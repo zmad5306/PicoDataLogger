@@ -31,6 +31,7 @@ struct AppConfig {
     mqtt_client_id: &'static str,
     mqtt_username: Option<&'static str>,
     mqtt_password: Option<&'static str>,
+    ntp_host: &'static str,
 }
 
 #[derive(Debug)]
@@ -40,6 +41,31 @@ enum ConfigError {
     MissingMqttHost,
     InvalidMqttPort,
     IncompleteMqttCredentials,
+}
+
+#[derive(Debug)]
+enum ResolveError {
+    Dns(embassy_net::dns::Error),
+    NoAddresses,
+}
+
+impl From<embassy_net::dns::Error> for ResolveError {
+    fn from(err: embassy_net::dns::Error) -> Self {
+        ResolveError::Dns(err)
+    }
+}
+
+impl ResolveError {
+    fn log(self, hostname: &str) {
+        match self {
+            Self::Dns(error) => {
+                log::error!("DNS lookup failed for {}: {:?}", hostname, error);
+            }
+            Self::NoAddresses => {
+                log::error!("DNS returned no IPv4 addresses for {}", hostname);
+            }
+        }
+    }
 }
 
 impl AppConfig {
@@ -58,6 +84,7 @@ impl AppConfig {
         let mqtt_client_id = option_env!("MQTT_CLIENT_ID").unwrap_or("pico-data-logger");
         let mqtt_username = option_env!("MQTT_USERNAME");
         let mqtt_password = option_env!("MQTT_PASSWORD");
+        let ntp_host = option_env!("NTP_HOST").unwrap_or("pool.ntp.org");
 
         match (mqtt_username, mqtt_password) {
             (None, None) | (Some(_), Some(_)) => {}
@@ -73,6 +100,7 @@ impl AppConfig {
             mqtt_client_id,
             mqtt_username,
             mqtt_password,
+            ntp_host,
         })
     }
 }
@@ -92,6 +120,107 @@ async fn cyw43_task(
 #[embassy_executor::task]
 async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
     runner.run().await;
+}
+
+async fn connect_wifi(
+    control: &mut cyw43::Control<'_>,
+    stack: &embassy_net::Stack<'_>,
+    ssid: &str,
+    password: &str,
+) {
+    loop {
+        let mut join_options = cyw43::JoinOptions::new(password.as_bytes());
+        join_options.auth = cyw43::JoinAuth::Wpa2;
+
+        log::info!("joining WiFi network: {}", ssid);
+
+        match control.join(ssid, join_options).await {
+            Ok(()) => {
+                log::info!("joined Wi-Fi network: {}", ssid);
+                break;
+            }
+            Err(error) => {
+                log::error!("join failed for Wi-Fi network {}: {:?}", ssid, error);
+                log::info!("retrying Wi-Fi join in 5 seconds");
+                Timer::after_secs(5).await;
+            }
+        }
+    }
+
+    log::info!("waiting for network link");
+    stack.wait_link_up().await;
+    log::info!("network link up; waiting for DHCP");
+
+    stack.wait_config_up().await;
+
+    match stack.config_v4() {
+        Some(ipv4_config) => {
+            log::info!(
+                "DHCP configured: address={:?}/{} gateway={:?} dns={:?}",
+                ipv4_config.address.address(),
+                ipv4_config.address.prefix_len(),
+                ipv4_config.gateway,
+                ipv4_config.dns_servers.as_slice()
+            );
+        }
+        None => {
+            log::error!("network configuration became ready without IPv4 configuration");
+        }
+    }
+}
+
+async fn resolve_ipv4(
+    stack: embassy_net::Stack<'_>,
+    hostname: &str,
+) -> Result<embassy_net::IpAddress, ResolveError> {
+    let mut last_error: Option<ResolveError> = None;
+    let max_attempts = 3;
+
+    for attempt in 1..=max_attempts {
+        log::info!(
+            "resolving host: {} (attempt {}/{})",
+            hostname,
+            attempt,
+            max_attempts
+        );
+
+        let lookup_result = stack
+            .dns_query(hostname, embassy_net::dns::DnsQueryType::A)
+            .await;
+
+        let query_result: Result<embassy_net::IpAddress, ResolveError> = match lookup_result {
+            Ok(addresses) => {
+                if addresses.is_empty() {
+                    log::error!("no addresses found for host {}", hostname);
+                    Err(ResolveError::NoAddresses)
+                } else {
+                    log::info!("found addresses for host {}: {:?}", hostname, addresses);
+                    Ok(addresses
+                        .first()
+                        .copied()
+                        .ok_or(ResolveError::NoAddresses)?)
+                }
+            }
+            Err(error) => {
+                log::error!("failed to resolve host {}: {:?}", hostname, error);
+                Err(ResolveError::from(error))
+            }
+        };
+
+        match query_result {
+            Ok(address) => {
+                return Ok(address);
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < max_attempts {
+                    Timer::after_millis(100).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or(ResolveError::NoAddresses))
 }
 
 #[embassy_executor::main(
@@ -170,84 +299,29 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    loop {
-        let mut join_options = cyw43::JoinOptions::new(config.wifi_password.as_bytes());
-        join_options.auth = cyw43::JoinAuth::Wpa2;
+    connect_wifi(&mut control, &stack, config.wifi_ssid, config.wifi_password).await;
 
-        log::info!("joining WiFi network: {}", config.wifi_ssid);
-
-        match control.join(config.wifi_ssid, join_options).await {
-            Ok(()) => {
-                log::info!("joined Wi-Fi network: {}", config.wifi_ssid);
-                break;
-            }
-            Err(error) => {
-                log::error!(
-                    "join failed for Wi-Fi network {}: {:?}",
-                    config.wifi_ssid,
-                    error
-                );
-                log::info!("retrying Wi-Fi join in 5 seconds");
-                Timer::after_secs(5).await;
-            }
+    let _mqtt_address = match resolve_ipv4(stack, config.mqtt_host).await {
+        Ok(address) => {
+            log::info!("resolved MQTT host {} to {:?}", config.mqtt_host, address);
+            Some(address)
         }
-    }
-
-    log::info!("waiting for network link");
-    stack.wait_link_up().await;
-    log::info!("network link up; waiting for DHCP");
-
-    stack.wait_config_up().await;
-
-    match stack.config_v4() {
-        Some(ipv4_config) => {
-            log::info!(
-                "DHCP configured: address={:?}/{} gateway={:?} dns={:?}",
-                ipv4_config.address.address(),
-                ipv4_config.address.prefix_len(),
-                ipv4_config.gateway,
-                ipv4_config.dns_servers.as_slice()
-            );
+        Err(error) => {
+            error.log(config.mqtt_host);
+            None
         }
-        None => {
-            log::error!("network configuration became ready without IPv4 configuration");
+    };
+
+    let _ntp_address = match resolve_ipv4(stack, config.ntp_host).await {
+        Ok(address) => {
+            log::info!("resolved NTP host {} to {:?}", config.ntp_host, address);
+            Some(address)
         }
-    }
-
-    for attempt in 1..=2 {
-        log::info!(
-            "resolving MQTT host: {} (attempt {}/{})",
-            config.mqtt_host,
-            attempt,
-            2
-        );
-
-        match stack
-            .dns_query(config.mqtt_host, embassy_net::dns::DnsQueryType::A)
-            .await
-        {
-            Ok(addresses) => match addresses.first() {
-                Some(address) => {
-                    log::info!("resolved MQTT host {} to {:?}", config.mqtt_host, address);
-                }
-                None => {
-                    log::error!(
-                        "DNS returned no IPv4 address for MQTT host {}",
-                        config.mqtt_host
-                    );
-                }
-            },
-            Err(error) => {
-                log::error!(
-                    "failed to resolve MQTT host {}: {:?}",
-                    config.mqtt_host,
-                    error
-                );
-            }
+        Err(error) => {
+            error.log(config.ntp_host);
+            None
         }
-
-        Timer::after_secs(1).await;
-    }
+    };
 
     loop {
         log::info!("uptime: {} seconds; LED on", started_at.elapsed().as_secs());
