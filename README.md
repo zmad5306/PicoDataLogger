@@ -19,6 +19,10 @@ The SHT40 is connected to the Pico 2 W using the following Qwiic wire mapping. P
 
 The I2C data and clock lines use GP0 and GP1, respectively.
 
+### Wireless power management
+
+The firmware explicitly configures the CYW43439 to use Embassy's `PowerSave` mode. This provides a balanced default for a continuously running data logger: the radio conserves power while remaining responsive enough for periodic network and MQTT activity.
+
 ## Build and deploy
 
 The Pico 2 W contains an RP2350A, and this project builds for its Arm Cortex-M33 cores. The repository's `.cargo/config.toml` selects `thumbv8m.main-none-eabihf` automatically, so the commands below should be run from the repository root.

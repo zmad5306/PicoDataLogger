@@ -7,6 +7,8 @@ publish = false
 [dependencies]
 cortex-m = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
+cyw43 = { version = "0.7", features = ["log"] }
+cyw43-pio = "0.10"
 
 embassy-executor = "0.10"
 embassy-time = "0.5"
