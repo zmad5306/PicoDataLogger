@@ -1,2 +1,3 @@
 /target/
 pico-data-logger.uf2
+.env

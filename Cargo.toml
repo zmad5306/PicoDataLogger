@@ -14,7 +14,7 @@ embassy-executor = "0.10"
 embassy-time = "0.5"
 embassy-usb = "0.6"
 embassy-usb-logger = "0.6"
-embassy-net = { version = "0.9", features = ["dhcpv4", "dns", "tcp"] }
+embassy-net = { version = "0.9", features = ["dhcpv4", "dns", "tcp", "udp"] }
 log = "0.4"
 static_cell = "2"
 panic-halt = "1.0"

@@ -77,11 +77,52 @@ function Start-SerialMonitor {
     }
 }
 
+function Import-DotEnv {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    foreach ($rawLine in Get-Content -LiteralPath $Path) {
+        $line = $rawLine.Trim()
+        if (-not $line -or $line.StartsWith("#")) {
+            continue
+        }
+
+        $parts = $line.Split("=", 2)
+        if ($parts.Count -ne 2) {
+            throw "Invalid .env entry: expected NAME=value"
+        }
+
+        $name = $parts[0].Trim()
+        $value = $parts[1].Trim()
+        if ($name -notmatch "^[A-Za-z_][A-Za-z0-9_]*$") {
+            throw "Invalid .env variable name: $name"
+        }
+
+        if ($value.Length -ge 2) {
+            $first = $value[0]
+            $last = $value[$value.Length - 1]
+            if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
+                $value = $value.Substring(1, $value.Length - 2)
+            }
+        }
+
+        [Environment]::SetEnvironmentVariable($name, $value, "Process")
+    }
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $elfPath = Join-Path $repoRoot "target/thumbv8m.main-none-eabihf/release/pico-data-logger"
 $uf2Path = Join-Path $repoRoot "target/pico-data-logger.uf2"
+$envFile = Join-Path $repoRoot ".env"
 
 Set-Location $repoRoot
+
+if (Test-Path -LiteralPath $envFile) {
+    Import-DotEnv -Path $envFile
+    Write-Host "Loaded build configuration from .env"
+}
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
     throw "cargo is not installed or is not on PATH"

@@ -7,8 +7,41 @@ REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 MOUNT_POINT="${1:-/Volumes/RP2350}"
 ELF_PATH="$REPO_ROOT/target/thumbv8m.main-none-eabihf/release/pico-data-logger"
 UF2_PATH="$REPO_ROOT/target/pico-data-logger.uf2"
+ENV_FILE="$REPO_ROOT/.env"
 
 cd "$REPO_ROOT"
+
+if [[ -f "$ENV_FILE" ]]; then
+    while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+        line="${raw_line%$'\r'}"
+        case "$line" in
+            ''|'#'*) continue ;;
+        esac
+
+        if [[ "$line" != *=* ]]; then
+            printf '%s\n' "error: invalid .env entry; expected NAME=value" >&2
+            exit 1
+        fi
+
+        name="${line%%=*}"
+        value="${line#*=}"
+        if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            printf 'error: invalid .env variable name: %s\n' "$name" >&2
+            exit 1
+        fi
+
+        if [[ ${#value} -ge 2 ]]; then
+            first="${value:0:1}"
+            last="${value: -1}"
+            if [[ ( "$first" == '"' && "$last" == '"' ) || ( "$first" == "'" && "$last" == "'" ) ]]; then
+                value="${value:1:${#value}-2}"
+            fi
+        fi
+
+        export "$name=$value"
+    done < "$ENV_FILE"
+    printf '%s\n' "Loaded build configuration from .env"
+fi
 
 if ! command -v cargo >/dev/null 2>&1; then
     printf '%s\n' "error: cargo is not installed or is not on PATH" >&2
