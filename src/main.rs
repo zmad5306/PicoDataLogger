@@ -203,7 +203,7 @@ async fn main(spawner: Spawner) {
         Some(ipv4_config) => {
             log::info!(
                 "DHCP configured: address={:?}/{} gateway={:?} dns={:?}",
-                ipv4_config.address,
+                ipv4_config.address.address(),
                 ipv4_config.address.prefix_len(),
                 ipv4_config.gateway,
                 ipv4_config.dns_servers.as_slice()
@@ -212,6 +212,41 @@ async fn main(spawner: Spawner) {
         None => {
             log::error!("network configuration became ready without IPv4 configuration");
         }
+    }
+
+    for attempt in 1..=2 {
+        log::info!(
+            "resolving MQTT host: {} (attempt {}/{})",
+            config.mqtt_host,
+            attempt,
+            2
+        );
+
+        match stack
+            .dns_query(config.mqtt_host, embassy_net::dns::DnsQueryType::A)
+            .await
+        {
+            Ok(addresses) => match addresses.first() {
+                Some(address) => {
+                    log::info!("resolved MQTT host {} to {:?}", config.mqtt_host, address);
+                }
+                None => {
+                    log::error!(
+                        "DNS returned no IPv4 address for MQTT host {}",
+                        config.mqtt_host
+                    );
+                }
+            },
+            Err(error) => {
+                log::error!(
+                    "failed to resolve MQTT host {}: {:?}",
+                    config.mqtt_host,
+                    error
+                );
+            }
+        }
+
+        Timer::after_secs(1).await;
     }
 
     loop {
