@@ -7,7 +7,8 @@ use embassy_executor::Spawner;
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
+use embassy_rp::i2c::{Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler};
+use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
@@ -23,6 +24,7 @@ bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
+    I2C0_IRQ => I2cInterruptHandler<I2C0>;
 });
 
 type UsbDriver = Driver<'static, USB>;
@@ -360,6 +362,17 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
 
     spawner.spawn(logger_task(driver).expect("Failed to start logger task"));
+
+    let mut i2c_config = I2cConfig::default();
+    i2c_config.frequency = 100_000; // 100 kHz
+    i2c_config.sda_pullup = false;
+    i2c_config.scl_pullup = false;
+
+    let _i2c = I2c::new_async(
+        p.I2C0, p.PIN_1, // SCL
+        p.PIN_0, // SDA
+        Irqs, i2c_config,
+    );
 
     let fw = aligned_bytes!("../firmware/43439A0.bin");
     let clm = aligned_bytes!("../firmware/43439A0_clm.bin");
