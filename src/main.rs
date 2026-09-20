@@ -16,7 +16,8 @@ use embassy_time::{Duration, Instant, Ticker, Timer, with_timeout};
 use panic_halt as _;
 use pico_data_logger::backoff::RetryBackoff;
 use pico_data_logger::ntp::{
-    NTP_PACKET_LEN, build_ntp_request, ntp_to_unix_seconds, validate_ntp_response,
+    NTP_PACKET_LEN, build_ntp_request, ntp_to_unix_seconds, unix_seconds_from_anchor,
+    validate_ntp_response,
 };
 use pico_data_logger::{Reading, encode_reading};
 use sht4x::{Precision, Sht4xAsync};
@@ -100,8 +101,7 @@ impl ResolveError {
 
 impl ClockAnchor {
     fn unix_now(&self) -> Result<u64, ClockError> {
-        self.unix_seconds
-            .checked_add(self.monotonic.elapsed().as_secs())
+        unix_seconds_from_anchor(self.unix_seconds, self.monotonic.elapsed().as_secs())
             .ok_or(ClockError::Overflow)
     }
 }
