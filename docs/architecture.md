@@ -35,6 +35,19 @@ flowchart TD
 
 The RP2350A provides two Cortex-M33 cores, 520 kB of SRAM, hardware floating point, and the peripherals used by the firmware. The Pico 2 W board supplies external QSPI flash for program storage and a CYW43439 radio for Wi-Fi.
 
+### Flash layout
+
+The linker divides the Pico 2 W's 4 MiB external flash into two non-overlapping regions:
+
+| Region | Address range | Capacity | Owner |
+| --- | --- | ---: | --- |
+| Firmware | `0x10000000..0x103c0000` | 3,840 KiB | Linker |
+| Measurement storage | `0x103c0000..0x10400000` | 256 KiB | Application |
+
+The measurement-storage region occupies the final 64 4-KiB erase sectors. Its start and size are erase-aligned so queue code can erase sectors without touching firmware bytes. `memory.x` fails the link if the firmware image reaches the reserved region and exports `__storage_start` and `__storage_end` for the flash driver integration.
+
+Each append-only record occupies one 256-byte page. A CRC-32 protects its versioned contents, and a commit marker is written last so recovery can reject interrupted writes. Acknowledgment clears another state bit after MQTT PUBACK. The queue keeps one sector as circular working space, batches erases by 16 records, and reconstructs ordering by sequence number after reboot. Its usable capacity is 1,008 readings, or 16 hours and 48 minutes at the 60-second interval.
+
 ## Runtime tasks
 
 Four long-lived async execution paths cooperate on the Embassy executor:
@@ -75,14 +88,16 @@ A successful reading crosses several distinct layers:
 ```mermaid
 flowchart LR
     SENSOR["SHT40 measurement"]
-    READING["Reading + UTC + uptime"]
+    READING["Reading + device IDs + sequence + UTC + uptime"]
+    QUEUE["Append-only flash queue"]
     JSON["JSON buffer"]
     MQTT["MQTT publication"]
     TCP["TCP stream"]
     WIFI["Wi-Fi"]
     BROKER["MQTT broker"]
 
-    SENSOR --> READING --> JSON --> MQTT --> TCP --> WIFI --> BROKER
+    SENSOR --> READING --> QUEUE --> JSON --> MQTT --> TCP --> WIFI --> BROKER
+    BROKER -->|"PUBACK"| QUEUE
 ```
 
 - I2C transports sensor commands and measurements.
@@ -92,7 +107,7 @@ flowchart LR
 - TCP provides MQTT with an ordered byte stream.
 - Wi-Fi carries IP traffic to the configured broker.
 
-MQTT publications use QoS 0 and are not retained. Successful submission does not prove that a subscriber consumed the message.
+MQTT publications use QoS 1 and are not retained. Each payload carries the configured MQTT client ID base as its human-readable `device_id` and the RP2350 OTP chip ID as `hardware_id`. The broker connection client ID is `<device_id>-<hardware_id>`, so physical devices remain unique even when a logical name is accidentally reused. Records remain in flash until PUBACK, so a reset between broker delivery and local retirement can replay the same `(hardware_id, sequence)` pair. This is intentionally at-least-once rather than exactly-once delivery.
 
 ## Time model
 
