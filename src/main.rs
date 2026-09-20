@@ -29,6 +29,7 @@ const MQTT_PACKET_RX_BUFFER_SIZE: usize = 512;
 const MQTT_PACKET_TX_BUFFER_SIZE: usize = 1024;
 const MQTT_KEEPALIVE_SECS: u16 = 90;
 const READING_JSON_BUFFER_SIZE: usize = 128;
+const PUBLISH_INTERVAL_SECS: u64 = 60;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -540,25 +541,7 @@ async fn main(spawner: Spawner) {
         (None, _, _) => None,
     };
 
-    let known_reading = Reading {
-        temperature_c: 23.4,
-        relative_humidity_pct: 45.6,
-        timestamp_unix_s: 1_700_000_000,
-        uptime_s: 120,
-    };
-
     let mut reading_json_buffer = [0_u8; READING_JSON_BUFFER_SIZE];
-
-    let mqtt_payload = match encode_reading(&known_reading, &mut reading_json_buffer) {
-        Ok(payload) => {
-            log::info!("encoded known MQTT test payload {} bytes", payload.len());
-            Some(payload)
-        }
-        Err(error) => {
-            log::error!("failed to encode known MQTT test payload: {:?}", error);
-            None
-        }
-    };
 
     let mqtt_session = mqtt_config.map(minimq::Session::new);
 
@@ -589,6 +572,8 @@ async fn main(spawner: Spawner) {
                         mqtt_socket.remote_endpoint()
                     );
 
+                    mqtt_socket.set_timeout(None);
+
                     match with_timeout(
                         Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
                         mqtt_session.connect(mqtt_socket),
@@ -598,37 +583,144 @@ async fn main(spawner: Spawner) {
                         Ok(Ok(mut connection)) => {
                             log::info!("MQTT CONNACK accepted: {:?}", connection.connect_event());
 
-                            match mqtt_payload {
-                                Some(payload) => {
-                                    let publication =
-                                        minimq::Publication::bytes(config.mqtt_topic, payload);
+                            let mut publish_ticker =
+                                Ticker::every(Duration::from_secs(PUBLISH_INTERVAL_SECS));
 
-                                    match connection.publish(publication).await {
-                                        Ok(None) => {
-                                            log::info!(
-                                                "MQTT QoS 0 test payload submitted: topic={}",
-                                                config.mqtt_topic
-                                            );
-                                            true
-                                        }
-                                        Ok(Some(_)) => {
-                                            log::error!(
-                                                "MQTT QoS 0 publish unexpectedly returned an operation handle"
-                                            );
-                                            false
-                                        }
-                                        Err(error) => {
-                                            log::error!("MQTT test publish failed: {:?}", error);
-                                            false
+                            loop {
+                                let live_reading = match sht40
+                                    .measure(Precision::High, &mut delay)
+                                    .await
+                                {
+                                    Ok(measurement) => {
+                                        let temperature_c = measurement
+                                            .temperature_celsius()
+                                            .checked_to_num::<f32>();
+                                        let relative_humidity_pct =
+                                            measurement.humidity_percent().checked_to_num::<f32>();
+
+                                        match (temperature_c, relative_humidity_pct) {
+                                            (Some(temperature_c), Some(relative_humidity_pct)) => {
+                                                match clock_anchor.unix_now() {
+                                                    Ok(timestamp_unix_s) => {
+                                                        let uptime_s =
+                                                            started_at.elapsed().as_secs();
+
+                                                        let reading = Reading {
+                                                            temperature_c,
+                                                            relative_humidity_pct,
+                                                            timestamp_unix_s,
+                                                            uptime_s,
+                                                        };
+
+                                                        log::info!(
+                                                            "live reading captured: temperature={:.2}°C humidity={:.2}% RH timestamp={} uptime={}",
+                                                            reading.temperature_c,
+                                                            reading.relative_humidity_pct,
+                                                            reading.timestamp_unix_s,
+                                                            reading.uptime_s
+                                                        );
+
+                                                        Some(reading)
+                                                    }
+                                                    Err(error) => {
+                                                        log::error!(
+                                                            "clock arithmetic failed while timestamping measurement: {:?}",
+                                                            error
+                                                        );
+                                                        None
+                                                    }
+                                                }
+                                            }
+                                            _ => {
+                                                log::error!(
+                                                    "SHT40 fixed-point measurement conversion failed"
+                                                );
+                                                None
+                                            }
                                         }
                                     }
-                                }
-                                None => {
+                                    Err(sht4x::Error::I2c(error)) => {
+                                        log::error!(
+                                            "SHT40 measurement failed: I2C error {:?}",
+                                            error
+                                        );
+                                        None
+                                    }
+                                    Err(sht4x::Error::Crc) => {
+                                        log::error!("SHT40 measurement failed: CRC error");
+                                        None
+                                    }
+                                    Err(error) => {
+                                        log::error!("SHT40 measurement failed {:?}", error);
+                                        None
+                                    }
+                                };
+
+                                let mqtt_payload = match live_reading.as_ref() {
+                                    Some(reading) => {
+                                        match encode_reading(reading, &mut reading_json_buffer) {
+                                            Ok(payload) => {
+                                                log::info!(
+                                                    "encoded live MQTT payload: {} bytes",
+                                                    payload.len()
+                                                );
+                                                Some(payload)
+                                            }
+                                            Err(error) => {
+                                                log::error!(
+                                                    "failed to encode live MQTT payload: {:?}",
+                                                    error
+                                                );
+                                                None
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        log::error!("MQTT publish skipped: no valid live reading");
+                                        None
+                                    }
+                                };
+
+                                match mqtt_payload {
+                                    Some(payload) => {
+                                        let publication =
+                                            minimq::Publication::bytes(config.mqtt_topic, payload);
+
+                                        match connection.publish(publication).await {
+                                            Ok(None) => {
+                                                log::info!(
+                                                    "MQTT QoS 0 sensor reading submitted: topic={}",
+                                                    config.mqtt_topic
+                                                );
+                                            }
+                                            Ok(Some(_)) => {
+                                                log::error!(
+                                                    "MQTT QoS 0 publish unexpectedly returned an operation handle"
+                                                );
+                                            }
+                                            Err(error) => {
+                                                log::error!(
+                                                    "MQTT sensor reading publish failed: {:?}",
+                                                    error
+                                                );
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        log::error!(
+                                            "MQTT sensor reading publish skipped: payload encoding failed"
+                                        );
+                                    }
+                                };
+
+                                if !connection.is_connected() {
                                     log::error!(
-                                        "MQTT test publish skipped: payload encoding failed"
+                                        "MQTT publishing loop stopped; connection will be retried"
                                     );
-                                    false
+                                    break false;
                                 }
+
+                                publish_ticker.next().await;
                             }
                         }
                         Ok(Err(error)) => {
@@ -671,63 +763,9 @@ async fn main(spawner: Spawner) {
         }
     }
 
-    let mut measurement_ticker = Ticker::every(Duration::from_secs(10));
-    let mut consecutive_measurements = 0_u32;
+    log::error!("MQTT publishing unavailable after all connection attempts");
 
     loop {
-        match sht40.measure(Precision::High, &mut delay).await {
-            Ok(measurement) => {
-                consecutive_measurements = consecutive_measurements.saturating_add(1);
-
-                let temperature = measurement.temperature_celsius();
-                let humidity = measurement.humidity_percent();
-
-                log::info!(
-                    "SHT40 measurement: temperature={:.2}°C, humidity={:.2}% RH consecutive={}",
-                    temperature,
-                    humidity,
-                    consecutive_measurements
-                );
-            }
-            Err(sht4x::Error::I2c(error)) => {
-                consecutive_measurements = 0;
-                log::error!("SHT40 measurement failed: I2C error {:?}", error);
-            }
-            Err(sht4x::Error::Crc) => {
-                consecutive_measurements = 0;
-                log::error!("SHT40 measurement failed: CRC error");
-            }
-            Err(error) => {
-                consecutive_measurements = 0;
-                log::error!("SHT40 measurement failed: {:?}", error);
-            }
-        };
-
-        let unix_seconds = match clock_anchor.unix_now() {
-            Ok(value) => value,
-            Err(error) => {
-                log::error!(
-                    "clock arithmetic failed {:?}; operation remains blocked",
-                    error
-                );
-                Timer::after_secs(5).await;
-                continue;
-            }
-        };
-
-        log::info!("current UTC: unix_seconds={}", unix_seconds);
-        log::info!("uptime: {} seconds; LED on", started_at.elapsed().as_secs());
-
-        control.gpio_set(0, true).await;
-        Timer::after_secs(1).await;
-
-        log::info!(
-            "uptime: {} seconds; LED off",
-            started_at.elapsed().as_secs()
-        );
-
-        control.gpio_set(0, false).await;
-
-        measurement_ticker.next().await;
+        Timer::after_secs(PUBLISH_INTERVAL_SECS).await;
     }
 }
