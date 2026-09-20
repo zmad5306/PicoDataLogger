@@ -24,6 +24,9 @@ const MQTT_TCP_BUFFER_SIZE: usize = 1024;
 const MQTT_TCP_TIMEOUT_SECS: u64 = 10;
 const MQTT_TCP_RETRY_DELAY_SECS: u64 = 10;
 const MQTT_TCP_ATTEMPTS: u8 = 3;
+const MQTT_PACKET_RX_BUFFER_SIZE: usize = 512;
+const MQTT_PACKET_TX_BUFFER_SIZE: usize = 1024;
+const MQTT_KEEPALIVE_SECS: u16 = 90;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -503,8 +506,41 @@ async fn main(spawner: Spawner) {
 
     let mut mqtt_rx_buffer = [0_u8; MQTT_TCP_BUFFER_SIZE];
     let mut mqtt_tx_buffer = [0_u8; MQTT_TCP_BUFFER_SIZE];
+    let mut mqtt_packet_rx_buffer = [0_u8; MQTT_PACKET_RX_BUFFER_SIZE];
+    let mut mqtt_packet_tx_buffer = [0_u8; MQTT_PACKET_TX_BUFFER_SIZE];
 
-    if let Some(endpoint) = mqtt_endpoint {
+    let mqtt_buffers = minimq::Buffers::new(&mut mqtt_packet_rx_buffer, &mut mqtt_packet_tx_buffer);
+
+    let mqtt_config =
+        match minimq::ConfigBuilder::new(mqtt_buffers).client_id(config.mqtt_client_id) {
+            Ok(builder) => Some(builder.keepalive_interval(MQTT_KEEPALIVE_SECS)),
+            Err(error) => {
+                log::error!("invalid MQTT client configuration: {:?}", error);
+                None
+            }
+        };
+
+    let mqtt_config = match (mqtt_config, config.mqtt_username, config.mqtt_password) {
+        (Some(builder), Some(username), Some(password)) => {
+            match builder.auth(username, password.as_bytes()) {
+                Ok(builder) => Some(builder),
+                Err(error) => {
+                    log::error!("invalid MQTT authentication configuration: {:?}", error);
+                    None
+                }
+            }
+        }
+        (Some(builder), None, None) => Some(builder),
+        (Some(_), _, _) => {
+            log::error!("MQTT username and password must be configured together");
+            None
+        }
+        (None, _, _) => None,
+    };
+
+    let mqtt_session = mqtt_config.map(minimq::Session::new);
+
+    if let (Some(endpoint), Some(mut mqtt_session)) = (mqtt_endpoint, mqtt_session) {
         for attempt in 1..=MQTT_TCP_ATTEMPTS {
             let mut mqtt_socket =
                 embassy_net::tcp::TcpSocket::new(stack, &mut mqtt_rx_buffer, &mut mqtt_tx_buffer);
@@ -518,7 +554,7 @@ async fn main(spawner: Spawner) {
                 MQTT_TCP_ATTEMPTS
             );
 
-            let connected = match with_timeout(
+            let mqtt_connected = match with_timeout(
                 Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
                 mqtt_socket.connect(endpoint),
             )
@@ -530,7 +566,29 @@ async fn main(spawner: Spawner) {
                         mqtt_socket.local_endpoint(),
                         mqtt_socket.remote_endpoint()
                     );
-                    true
+
+                    match with_timeout(
+                        Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
+                        mqtt_session.connect(mqtt_socket),
+                    )
+                    .await
+                    {
+                        Ok(Ok(connection)) => {
+                            log::info!("MQTT CONNACK accepted: {:?}", connection.connect_event());
+                            true
+                        }
+                        Ok(Err(error)) => {
+                            log::error!("MQTT session establishment failed: {:?}", error);
+                            false
+                        }
+                        Err(_) => {
+                            log::error!(
+                                "MQTT session establishment timed out after {} seconds",
+                                MQTT_TCP_TIMEOUT_SECS
+                            );
+                            false
+                        }
+                    }
                 }
                 Ok(Err(error)) => {
                     log::error!("MQTT TCP connection failed: {:?}", error);
@@ -545,12 +603,9 @@ async fn main(spawner: Spawner) {
                 }
             };
 
-            if connected {
-                mqtt_socket.close();
-                log::info!("MQTT TCP checkpoint socket closed");
+            if mqtt_connected {
+                break;
             }
-
-            drop(mqtt_socket);
 
             if attempt < MQTT_TCP_ATTEMPTS {
                 log::info!(
