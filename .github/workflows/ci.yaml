@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  formatting:
+    name: Formatting
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+  host-tests:
+    name: Host library tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - name: Run host library tests
+        run: cargo test --lib --target x86_64-unknown-linux-gnu
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy
+
+      - name: Lint host library
+        run: cargo clippy --lib --target x86_64-unknown-linux-gnu -- -D warnings
+
+  firmware-build:
+    name: Pico release build
+    runs-on: ubuntu-latest
+    env:
+      WIFI_SSID: ci-placeholder
+      WIFI_PASSWORD: ci-placeholder
+      MQTT_HOST: broker.example.invalid
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          targets: thumbv8m.main-none-eabihf
+
+      - name: Build release firmware
+        run: cargo build --release
