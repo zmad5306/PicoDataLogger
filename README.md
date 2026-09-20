@@ -196,7 +196,7 @@ Copy the UF2 to the mounted bootloader volume:
 cp pico-data-logger.uf2 /Volumes/RP2350/
 ```
 
-After accepting the complete UF2, the ROM bootloader writes the application to external flash and automatically reboots. `/Volumes/RP2350` should disappear within a few seconds. Do not expect the Pico 2 W's onboard LED to light automatically; this firmware does not configure that LED.
+After accepting the complete UF2, the ROM bootloader writes the application to external flash and automatically reboots. `/Volumes/RP2350` should disappear within a few seconds. Once the CYW43439 is initialized, the onboard LED enters its rapid-flash startup state until the first sample attempt takes priority.
 
 ### 5. Connect to USB serial
 
@@ -338,23 +338,35 @@ Recovery discards state from the failed layer upward:
 
 The USB logger remains a separate task throughout these paths, so the serial log should continue reporting recovery transitions while the application waits.
 
+### Onboard status LED
+
+The Pico 2 W onboard LED is wired to the CYW43439 radio module's `WL_GPIO0`, not to an RP2350 GPIO such as GP25. The firmware therefore drives it through the same initialized CYW43439 control path used for Wi-Fi:
+
+| Pattern | Meaning |
+| --- | --- |
+| Off | Healthy waiting between samples after a broker-acknowledged publication |
+| Solid on | A sample is being measured, converted, queued, encoded, or submitted to MQTT |
+| Rapid flash (100 ms on / 100 ms off) | A sensor, conversion, storage, configuration, Wi-Fi, DNS, NTP, TCP, or MQTT fault is being reported or recovered |
+
+Startup uses the rapid-flash state because the logger has not yet completed a publish cycle. The firmware keeps advancing the 100 ms flash phase while it awaits Wi-Fi association, network link, DHCP, DNS, NTP, TCP, and MQTT setup. Non-radio futures stay pinned and are not restarted on each LED tick. Wi-Fi association uses the repository's narrowly patched `cyw43::Control::join_with_gpio_flash`, which services `WL_GPIO0` inside the driver's association-event loop because `Control::join` otherwise holds the only control handle. A new sample attempt temporarily changes the indication to solid on. A failure returns it to rapid flashing. With the current QoS 1 queue, the LED returns to off only after the broker's PUBACK is received and the corresponding flash record is retired. PUBACK confirms broker receipt, but it does not prove that any subscriber processed the reading.
+
 ## Recovery troubleshooting and acceptance checks
 
 Keep the USB serial monitor and MQTT subscriber visible during each check. Do not reset the Pico while testing recovery.
 
 ### Sensor interruption
 
-1. Confirm readings are arriving every 60 seconds.
-2. Disconnect the SHT40, wait for a sample, and confirm an I2C failure is logged without a reboot.
+1. Confirm readings are arriving every 60 seconds; the LED is off while waiting, solid during a sample, and off again after its publication is acknowledged.
+2. Disconnect the SHT40, wait for a sample, and confirm an I2C failure is logged and the LED rapidly flashes without a reboot.
 3. Reconnect the sensor using 3V3, GND, GP0/SDA, and GP1/SCL.
-4. Confirm a later sample is published and `uptime_s` continues increasing.
+4. Confirm a later sample is published, the LED returns to off after PUBACK, and `uptime_s` continues increasing.
 
 ### Broker outage
 
 1. Subscribe to the readings topic and note the latest `sequence` and `timestamp_unix_s`.
-2. Block broker access for at least three 60-second sample intervals and confirm serial queue depth grows.
+2. Block broker access for at least three 60-second sample intervals and confirm serial queue depth grows while the LED rapidly flashes between solid sample attempts.
 3. Power-cycle the Pico while broker access remains blocked; confirm recovery logs the preserved queue depth.
-4. Restore broker access and observe the queued timestamps arrive in ascending sequence order before normal live publishing resumes.
+4. Restore broker access and observe the queued timestamps arrive in ascending sequence order before normal live publishing resumes; confirm the LED returns to off after the backlog is acknowledged.
 5. Confirm any duplicate carries the same sequence number and that recovery requires no manual reset.
 
 If the broker repeatedly reports a timeout, confirm the firmware services the MQTT connection between samples and that its keepalive is not being blocked by a firewall or container networking rule.

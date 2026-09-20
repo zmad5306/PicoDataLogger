@@ -40,3 +40,8 @@ codegen-units = 1
 debug = 2
 lto = "fat"
 opt-level = "s"
+
+[patch.crates-io]
+# Local, narrowly scoped extension: keep WL_GPIO0 flashing while Control::join
+# waits for association events. See vendor/cyw43/README-PICODATALOGGER.md.
+cyw43 = { path = "vendor/cyw43" }
