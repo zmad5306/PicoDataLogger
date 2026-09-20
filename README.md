@@ -228,3 +228,165 @@ system_profiler SPUSBDataType
 ```
 
 Reconnect with the newly reported device instead of reusing a stale name from an earlier boot.
+
+## Runtime architecture
+
+The firmware uses independently scheduled Embassy tasks for USB logging, the CYW43439 radio, and the network stack. The main application owns the SHT40, time synchronization, MQTT session, and recovery supervisor. A blocked or failed network operation therefore does not intentionally stop USB diagnostics or the network driver tasks.
+
+The data path is:
+
+```text
+SHT40 over I2C
+  -> fixed-point measurement conversion
+  -> reading with synchronized UTC and uptime
+  -> JSON encoded into a reusable fixed-size buffer
+  -> MQTT QoS 0 publication over TCP/Wi-Fi
+  -> broker subscriber
+```
+
+The application does not allocate a new JSON or network buffer for every reading. Its sensor, JSON, TCP, and MQTT packet buffers have fixed sizes and are reused. See [docs/architecture.md](docs/architecture.md) for the hardware and Embassy layers beneath the application.
+
+## Normal operation
+
+At boot the firmware:
+
+1. Starts USB logging and the radio/network tasks.
+2. Reads the SHT40 serial number.
+3. Joins the configured Wi-Fi network and waits for DHCP.
+4. Resolves the NTP host and waits until it obtains a valid UTC clock anchor.
+5. Resolves the MQTT broker, opens TCP, and establishes the MQTT session.
+6. Measures and publishes once every 60 seconds while servicing MQTT traffic between samples.
+
+Each reading is timestamped when the measurement is captured, before JSON encoding and network delivery. The firmware publishes both absolute UTC and uptime because they answer different questions: UTC identifies when the measurement occurred, while uptime helps identify reboots and how long the current run has lasted.
+
+The UTC anchor is refreshed after network recovery and at least once per day. A failed refresh does not replace a valid anchor with uptime; it retains the last valid anchor and retries with bounded backoff.
+
+### Observe MQTT readings
+
+Subscribe before or after flashing the Pico:
+
+```sh
+mosquitto_sub \
+  -h broker.example.com \
+  -p 1883 \
+  -V 5 \
+  -t pico-data-logger/readings \
+  -v
+```
+
+For a broker running in Docker, the same check can be run inside its container:
+
+```sh
+docker exec -it <mosquitto-container> \
+  mosquitto_sub \
+  -h localhost \
+  -p 1883 \
+  -V 5 \
+  -t pico-data-logger/readings \
+  -v
+```
+
+Use the configured host, port, topic, and authentication flags when they differ from the defaults. A reading has this shape:
+
+```json
+{"temperature_c":21.34,"relative_humidity_pct":43.13,"timestamp_unix_s":1789916205,"uptime_s":16}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `temperature_c` | SHT40 temperature in degrees Celsius. |
+| `relative_humidity_pct` | SHT40 relative humidity percentage. |
+| `timestamp_unix_s` | UTC Unix timestamp captured with the measurement. |
+| `uptime_s` | Whole seconds since this firmware booted. |
+
+Publications use MQTT QoS 0 and are not retained. Submission means the client handed the publication to the MQTT connection; it does not guarantee that a subscriber consumed it, and an offline subscriber does not receive a queued copy later.
+
+## Recovery behavior
+
+The application is supervised indefinitely rather than stopping after a fixed number of attempts. Connection retries use delays of 1, 2, 4, 8, 16, 32, and then at most 60 seconds. A successful MQTT connection resets that connection backoff.
+
+Recovery discards state from the failed layer upward:
+
+- A failed SHT40 read skips one publication and retries at the next 60-second sample without dropping a healthy MQTT session.
+- A broker DNS, TCP, MQTT handshake, publish, keepalive, or disconnect failure drops the MQTT connection and TCP socket. The next attempt resolves the broker again and creates fresh transport state.
+- A lost Wi-Fi link returns to Wi-Fi join and DHCP before DNS, NTP, TCP, and MQTT are rebuilt.
+- A UTC refresh failure retains the last valid clock anchor and retries with the same bounded-backoff policy. A successful refresh resets that backoff and schedules the next daily refresh.
+
+The USB logger remains a separate task throughout these paths, so the serial log should continue reporting recovery transitions while the application waits.
+
+## Recovery troubleshooting and acceptance checks
+
+Keep the USB serial monitor and MQTT subscriber visible during each check. Do not reset the Pico while testing recovery.
+
+### Sensor interruption
+
+1. Confirm readings are arriving every 60 seconds.
+2. Disconnect the SHT40, wait for a sample, and confirm an I2C failure is logged without a reboot.
+3. Reconnect the sensor using 3V3, GND, GP0/SDA, and GP1/SCL.
+4. Confirm a later sample is published and `uptime_s` continues increasing.
+
+### Broker outage
+
+1. Stop the broker for longer than the former three-attempt window and observe continued bounded retries.
+2. Start the broker again.
+3. Confirm a fresh TCP/MQTT connection is established and publications resume without resetting the Pico.
+
+If the broker repeatedly reports a timeout, confirm the firmware services the MQTT connection between samples and that its keepalive is not being blocked by a firewall or container networking rule.
+
+### Wi-Fi interruption
+
+1. Interrupt the configured Wi-Fi network long enough for the Pico to detect link loss.
+2. Restore the network.
+3. Confirm the log returns through Wi-Fi join, DHCP, UTC refresh, broker DNS, TCP, and MQTT.
+4. Confirm publications resume and `uptime_s` did not restart.
+
+### NTP unavailable at boot
+
+1. Make the configured NTP service unreachable before booting the Pico.
+2. Confirm the firmware reports that time remains unsynchronized and does not publish readings with uptime substituted for UTC.
+3. Restore NTP reachability.
+4. Confirm synchronization succeeds and normal MQTT publishing begins without resetting the Pico.
+
+### Common network failures
+
+- **DNS resolution fails:** verify DHCP supplied reachable DNS servers and that `MQTT_HOST` and `NTP_HOST` are valid from the Pico's network.
+- **TCP is reset or times out:** verify the broker is running, listening on `MQTT_PORT`, published through its Docker/network configuration, and allowed by host and network firewalls.
+- **MQTT handshake fails:** verify the protocol listener, client ID policy, and the username/password pair. A second connection using the same client ID can cause a broker to disconnect the older client.
+- **No subscriber output:** verify the subscriber uses the configured topic and authentication. QoS 0 messages published while the subscriber is offline are not replayed.
+- **Timestamps are implausible:** inspect the NTP validation and clock-anchor logs. Uptime is diagnostic metadata and must not be interpreted as Unix time.
+
+## Automated checks
+
+GitHub Actions runs four independent checks on pull requests and pushes to `main`:
+
+- `cargo fmt --check`
+- host library tests on `x86_64-unknown-linux-gnu`
+- host library Clippy with warnings denied
+- a release cross-build for `thumbv8m.main-none-eabihf` using placeholder configuration
+
+These checks validate formatting, host-testable logic, linting, and compilation. They cannot prove that USB, Wi-Fi, DHCP, I2C, the physical SHT40, NTP reachability, or the MQTT broker work on real hardware; use the acceptance checks above for those behaviors.
+
+## Security limitations
+
+This is a LAN learning project, not a hardened production design:
+
+- MQTT uses plaintext TCP. Network observers can read payloads and credentials, and the Pico does not authenticate the broker with TLS.
+- NTP is unauthenticated. A network attacker could spoof time and cause incorrect measurement timestamps.
+- Wi-Fi and optional MQTT credentials are compiled into the firmware. Ignoring `.env` prevents an ordinary source-control leak but does not protect secrets extracted from the firmware binary or physical device.
+- QoS 0 prioritizes simplicity and low overhead over guaranteed delivery.
+
+A production design should evaluate MQTT over TLS with broker certificate validation, protected credential provisioning/storage, authenticated time, and an explicit offline-delivery policy.
+
+## Learning recap
+
+- **Ownership and borrowing:** drivers, sockets, buffers, and protocol sessions have clear owners; borrowed buffers cannot be reused while an async operation still depends on them.
+- **Lifetimes:** the encoded JSON slice is tied to the caller-provided buffer, preventing it from outliving that storage.
+- **Traits:** Embassy and device crates connect generic drivers through embedded I/O traits rather than application code manipulating registers directly.
+- **`Result` and `Option`:** expected configuration, conversion, encoding, sensor, DNS, and protocol failures are handled explicitly instead of panicking.
+- **Async tasks:** the Embassy executor allows USB logging, the radio, networking, timers, and application work to make progress cooperatively without OS threads.
+- **Static memory:** fixed-size sensor, JSON, TCP, and MQTT buffers make memory use predictable and avoid garbage collection or an allocator.
+- **I2C:** the RP2350 communicates with the SHT40 over the GP0/GP1 I2C bus and validates sensor responses.
+- **UDP and NTP:** a validated NTP response anchors Unix time to a monotonic `Instant`; later timestamps advance from that known point.
+- **TCP:** TCP supplies MQTT's ordered byte transport but does not understand MQTT topics, publications, sessions, or keepalive.
+- **JSON:** a typed `Reading` is serialized into a reusable caller-owned buffer, with an explicit error when that buffer is too small.
+- **MQTT:** the client maintains a protocol session over TCP, services keepalive traffic between samples, publishes QoS 0 readings, and recreates failed connection state under the supervisor.

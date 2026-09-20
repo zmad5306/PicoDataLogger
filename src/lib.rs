@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod backoff;
 pub mod ntp;
 
 /// A sensor measurement with its collection time and device uptime.

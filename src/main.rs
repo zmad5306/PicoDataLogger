@@ -4,6 +4,7 @@
 use cyw43::aligned_bytes;
 use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_rp::bind_interrupts;
 use embassy_rp::dma;
 use embassy_rp::gpio::{Level, Output};
@@ -13,6 +14,7 @@ use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_time::{Duration, Instant, Ticker, Timer, with_timeout};
 use panic_halt as _;
+use pico_data_logger::backoff::RetryBackoff;
 use pico_data_logger::ntp::{
     NTP_PACKET_LEN, build_ntp_request, ntp_to_unix_seconds, validate_ntp_response,
 };
@@ -23,13 +25,13 @@ use static_cell::StaticCell;
 const NTP_PORT: u16 = 123;
 const MQTT_TCP_BUFFER_SIZE: usize = 1024;
 const MQTT_TCP_TIMEOUT_SECS: u64 = 10;
-const MQTT_TCP_RETRY_DELAY_SECS: u64 = 10;
-const MQTT_TCP_ATTEMPTS: u8 = 3;
 const MQTT_PACKET_RX_BUFFER_SIZE: usize = 512;
 const MQTT_PACKET_TX_BUFFER_SIZE: usize = 1024;
 const MQTT_KEEPALIVE_SECS: u16 = 90;
 const READING_JSON_BUFFER_SIZE: usize = 128;
 const PUBLISH_INTERVAL_SECS: u64 = 60;
+const UTC_REFRESH_INTERVAL_SECS: u64 = 24 * 60 * 60;
+const WIFI_JOIN_TIMEOUT_SECS: u64 = 15;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -168,19 +170,35 @@ async fn connect_wifi(
         let mut join_options = cyw43::JoinOptions::new(password.as_bytes());
         join_options.auth = cyw43::JoinAuth::Wpa2;
 
-        log::info!("joining WiFi network: {}", ssid);
+        log::info!(
+            "joining configured Wi-Fi network with {}-second timeout",
+            WIFI_JOIN_TIMEOUT_SECS
+        );
 
-        match control.join(ssid, join_options).await {
-            Ok(()) => {
-                log::info!("joined Wi-Fi network: {}", ssid);
+        match select(
+            Timer::after_secs(WIFI_JOIN_TIMEOUT_SECS),
+            control.join(ssid, join_options),
+        )
+        .await
+        {
+            Either::First(()) => {
+                log::error!(
+                    "Wi-Fi join timed out after {} seconds",
+                    WIFI_JOIN_TIMEOUT_SECS
+                );
+                control.leave().await;
+            }
+            Either::Second(Ok(())) => {
+                log::info!("joined configured Wi-Fi network");
                 break;
             }
-            Err(error) => {
-                log::error!("join failed for Wi-Fi network {}: {:?}", ssid, error);
-                log::info!("retrying Wi-Fi join in 5 seconds");
-                Timer::after_secs(5).await;
+            Either::Second(Err(error)) => {
+                log::error!("Wi-Fi join failed: {:?}", error);
             }
         }
+
+        log::info!("retrying Wi-Fi join in 5 seconds");
+        Timer::after_secs(5).await;
     }
 
     log::info!("waiting for network link");
@@ -471,23 +489,7 @@ async fn main(spawner: Spawner) {
 
     connect_wifi(&mut control, &stack, config.wifi_ssid, config.wifi_password).await;
 
-    let mqtt_endpoint = match resolve_ipv4(stack, config.mqtt_host).await {
-        Ok(address) => {
-            let endpoint = embassy_net::IpEndpoint::new(address, config.mqtt_port);
-            log::info!(
-                "resolved MQTT endpoint: host={} endpoint={:?}",
-                config.mqtt_host,
-                endpoint
-            );
-            Some(endpoint)
-        }
-        Err(error) => {
-            error.log(config.mqtt_host);
-            None
-        }
-    };
-
-    let clock_anchor = loop {
+    let mut clock_anchor = loop {
         log::info!("attempting NTP synchronization");
 
         match resolve_ipv4(stack, config.ntp_host).await {
@@ -506,6 +508,9 @@ async fn main(spawner: Spawner) {
         log::info!("time remains unsynchronized; retrying in 5 seconds");
         Timer::after_secs(5).await;
     };
+
+    let mut next_utc_refresh_at = Instant::now() + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS);
+    let mut utc_refresh_backoff = RetryBackoff::new();
 
     let mut mqtt_rx_buffer = [0_u8; MQTT_TCP_BUFFER_SIZE];
     let mut mqtt_tx_buffer = [0_u8; MQTT_TCP_BUFFER_SIZE];
@@ -545,21 +550,111 @@ async fn main(spawner: Spawner) {
 
     let mqtt_session = mqtt_config.map(minimq::Session::new);
 
-    if let (Some(endpoint), Some(mut mqtt_session)) = (mqtt_endpoint, mqtt_session) {
-        for attempt in 1..=MQTT_TCP_ATTEMPTS {
+    if let Some(mut mqtt_session) = mqtt_session {
+        let mut reconnect_backoff = RetryBackoff::new();
+
+        // supervisor
+        loop {
+            let mut network_recovered = false;
+
+            if !stack.is_link_up() {
+                log::info!("network link is down; clearing stale Wi-Fi association state");
+                control.leave().await;
+
+                log::info!("returning to Wi-Fi join");
+                connect_wifi(&mut control, &stack, config.wifi_ssid, config.wifi_password).await;
+                network_recovered = true;
+            }
+
+            if !stack.is_config_up() {
+                log::info!("network link is up; waiting for DHCP configuration");
+
+                match select(stack.wait_config_up(), stack.wait_link_down()).await {
+                    Either::First(()) => {
+                        log::info!("network configuration restored");
+                        network_recovered = true;
+                    }
+                    Either::Second(()) => {
+                        log::info!("network link dropped while waiting for DHCP");
+                        continue;
+                    }
+                }
+            }
+
+            if network_recovered {
+                log::info!("network recovered; attempting UTC resynchronization");
+
+                match resolve_ipv4(stack, config.ntp_host).await {
+                    Ok(address) => {
+                        let request_id = rng.next_u64();
+
+                        match synchronize_clock(stack, address, request_id).await {
+                            Some(refreshed_anchor) => {
+                                clock_anchor = refreshed_anchor;
+                                utc_refresh_backoff.reset();
+                                next_utc_refresh_at =
+                                    Instant::now() + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS);
+                                log::info!("UTC clock anchor refreshed after network recovery");
+                            }
+                            None => {
+                                let retry_delay_secs = utc_refresh_backoff.next_delay_secs();
+                                next_utc_refresh_at =
+                                    Instant::now() + Duration::from_secs(retry_delay_secs);
+                                log::error!(
+                                    "UTC refresh failed after network recovery; retaining last valid anchor and retrying in {} seconds",
+                                    retry_delay_secs
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        error.log(config.ntp_host);
+                        let retry_delay_secs = utc_refresh_backoff.next_delay_secs();
+                        next_utc_refresh_at =
+                            Instant::now() + Duration::from_secs(retry_delay_secs);
+                        log::error!(
+                            "UTC refresh unavailable after network recovery; retaining last valid anchor and retrying in {} seconds",
+                            retry_delay_secs
+                        );
+                    }
+                }
+            }
+
+            let endpoint = match resolve_ipv4(stack, config.mqtt_host).await {
+                Ok(address) => {
+                    let endpoint = embassy_net::IpEndpoint::new(address, config.mqtt_port);
+
+                    log::info!(
+                        "resolved MQTT endpoint: host={} endpoint={:?}",
+                        config.mqtt_host,
+                        endpoint
+                    );
+
+                    endpoint
+                }
+                Err(error) => {
+                    error.log(config.mqtt_host);
+
+                    let retry_delay_secs = reconnect_backoff.next_delay_secs();
+
+                    log::info!(
+                        "broker DNS unavailable; retrying in {} secs",
+                        retry_delay_secs
+                    );
+
+                    Timer::after_secs(retry_delay_secs).await;
+                    continue;
+                }
+            };
+
             let mut mqtt_socket =
                 embassy_net::tcp::TcpSocket::new(stack, &mut mqtt_rx_buffer, &mut mqtt_tx_buffer);
 
             mqtt_socket.set_timeout(Some(Duration::from_secs(MQTT_TCP_TIMEOUT_SECS)));
 
-            log::info!(
-                "connecting to MQTT endpoint {:?} (attempt {}/{})",
-                endpoint,
-                attempt,
-                MQTT_TCP_ATTEMPTS
-            );
+            log::info!("connecting to MQTT endpoint {:?}", endpoint);
 
-            let mqtt_connected = match with_timeout(
+            match with_timeout(
                 Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
                 mqtt_socket.connect(endpoint),
             )
@@ -583,10 +678,12 @@ async fn main(spawner: Spawner) {
                         Ok(Ok(mut connection)) => {
                             log::info!("MQTT CONNACK accepted: {:?}", connection.connect_event());
 
+                            reconnect_backoff.reset();
+
                             let mut publish_ticker =
                                 Ticker::every(Duration::from_secs(PUBLISH_INTERVAL_SECS));
 
-                            loop {
+                            'publishing: loop {
                                 let live_reading = match sht40
                                     .measure(Precision::High, &mut delay)
                                     .await
@@ -706,64 +803,122 @@ async fn main(spawner: Spawner) {
                                             }
                                         }
                                     }
-                                    None => {
-                                        log::error!(
-                                            "MQTT sensor reading publish skipped: payload encoding failed"
-                                        );
-                                    }
+                                    None => {}
                                 };
 
                                 if !connection.is_connected() {
                                     log::error!(
                                         "MQTT publishing loop stopped; connection will be retried"
                                     );
-                                    break false;
+                                    break;
                                 }
 
-                                publish_ticker.next().await;
+                                loop {
+                                    let utc_refresh_due = loop {
+                                        match select3(
+                                            publish_ticker.next(),
+                                            connection.poll(),
+                                            Timer::at(next_utc_refresh_at),
+                                        )
+                                        .await
+                                        {
+                                            Either3::First(()) => {
+                                                break false;
+                                            }
+                                            Either3::Second(Ok(Some(_publication))) => {
+                                                log::info!(
+                                                    "received an unexpected MQTT publication while waiting"
+                                                );
+                                            }
+                                            Either3::Second(Ok(None)) => {
+                                                // Minimq made internal progress, such as keepalive traffic.
+                                            }
+                                            Either3::Second(Err(error)) => {
+                                                log::error!(
+                                                    "MQTT session service failed while waiting for next sample: {:?}",
+                                                    error
+                                                );
+                                                break 'publishing;
+                                            }
+                                            Either3::Third(()) => {
+                                                log::info!("UTC refresh deadline reached");
+                                                break true;
+                                            }
+                                        }
+                                    };
+
+                                    if !utc_refresh_due {
+                                        break;
+                                    }
+
+                                    let refreshed_anchor =
+                                        match resolve_ipv4(stack, config.ntp_host).await {
+                                            Ok(address) => {
+                                                let request_id = rng.next_u64();
+                                                synchronize_clock(stack, address, request_id).await
+                                            }
+                                            Err(error) => {
+                                                error.log(config.ntp_host);
+                                                None
+                                            }
+                                        };
+
+                                    match refreshed_anchor {
+                                        Some(anchor) => {
+                                            clock_anchor = anchor;
+                                            utc_refresh_backoff.reset();
+                                            next_utc_refresh_at = Instant::now()
+                                                + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS);
+                                            log::info!("scheduled UTC clock refresh succeeded");
+                                        }
+                                        None => {
+                                            let retry_delay_secs =
+                                                utc_refresh_backoff.next_delay_secs();
+                                            next_utc_refresh_at = Instant::now()
+                                                + Duration::from_secs(retry_delay_secs);
+                                            log::error!(
+                                                "scheduled UTC clock refresh failed; retaining last valid anchor and retrying in {} seconds",
+                                                retry_delay_secs
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                         Ok(Err(error)) => {
                             log::error!("MQTT session establishment failed: {:?}", error);
-                            false
                         }
                         Err(_) => {
                             log::error!(
                                 "MQTT session establishment timed out after {} seconds",
                                 MQTT_TCP_TIMEOUT_SECS
                             );
-                            false
                         }
-                    }
+                    };
                 }
                 Ok(Err(error)) => {
                     log::error!("MQTT TCP connection failed: {:?}", error);
-                    false
                 }
                 Err(_) => {
                     log::error!(
                         "MQTT TCP connection timed out after {} seconds",
                         MQTT_TCP_TIMEOUT_SECS
                     );
-                    false
                 }
             };
 
-            if mqtt_connected {
-                break;
-            }
+            let retry_delay_secs = reconnect_backoff.next_delay_secs();
 
-            if attempt < MQTT_TCP_ATTEMPTS {
-                log::info!(
-                    "creating a fresh MQTT TCP socket in {} seconds",
-                    MQTT_TCP_RETRY_DELAY_SECS
-                );
-                Timer::after_secs(MQTT_TCP_RETRY_DELAY_SECS).await;
-            }
+            log::info!(
+                "creating a fresh MQTT TCP socket in {} seconds",
+                retry_delay_secs
+            );
+
+            Timer::after_secs(retry_delay_secs).await;
         }
     }
 
-    log::error!("MQTT publishing unavailable after all connection attempts");
+    log::error!("MQTT configuration unavailable; supervisor cannot start");
 
     loop {
         Timer::after_secs(PUBLISH_INTERVAL_SECS).await;
