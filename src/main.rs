@@ -16,6 +16,7 @@ use panic_halt as _;
 use pico_data_logger::ntp::{
     NTP_PACKET_LEN, build_ntp_request, ntp_to_unix_seconds, validate_ntp_response,
 };
+use pico_data_logger::{Reading, encode_reading};
 use sht4x::{Precision, Sht4xAsync};
 use static_cell::StaticCell;
 
@@ -27,6 +28,7 @@ const MQTT_TCP_ATTEMPTS: u8 = 3;
 const MQTT_PACKET_RX_BUFFER_SIZE: usize = 512;
 const MQTT_PACKET_TX_BUFFER_SIZE: usize = 1024;
 const MQTT_KEEPALIVE_SECS: u16 = 90;
+const READING_JSON_BUFFER_SIZE: usize = 128;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -538,6 +540,26 @@ async fn main(spawner: Spawner) {
         (None, _, _) => None,
     };
 
+    let known_reading = Reading {
+        temperature_c: 23.4,
+        relative_humidity_pct: 45.6,
+        timestamp_unix_s: 1_700_000_000,
+        uptime_s: 120,
+    };
+
+    let mut reading_json_buffer = [0_u8; READING_JSON_BUFFER_SIZE];
+
+    let mqtt_payload = match encode_reading(&known_reading, &mut reading_json_buffer) {
+        Ok(payload) => {
+            log::info!("encoded known MQTT test payload {} bytes", payload.len());
+            Some(payload)
+        }
+        Err(error) => {
+            log::error!("failed to encode known MQTT test payload: {:?}", error);
+            None
+        }
+    };
+
     let mqtt_session = mqtt_config.map(minimq::Session::new);
 
     if let (Some(endpoint), Some(mut mqtt_session)) = (mqtt_endpoint, mqtt_session) {
@@ -573,9 +595,41 @@ async fn main(spawner: Spawner) {
                     )
                     .await
                     {
-                        Ok(Ok(connection)) => {
+                        Ok(Ok(mut connection)) => {
                             log::info!("MQTT CONNACK accepted: {:?}", connection.connect_event());
-                            true
+
+                            match mqtt_payload {
+                                Some(payload) => {
+                                    let publication =
+                                        minimq::Publication::bytes(config.mqtt_topic, payload);
+
+                                    match connection.publish(publication).await {
+                                        Ok(None) => {
+                                            log::info!(
+                                                "MQTT QoS 0 test payload submitted: topic={}",
+                                                config.mqtt_topic
+                                            );
+                                            true
+                                        }
+                                        Ok(Some(_)) => {
+                                            log::error!(
+                                                "MQTT QoS 0 publish unexpectedly returned an operation handle"
+                                            );
+                                            false
+                                        }
+                                        Err(error) => {
+                                            log::error!("MQTT test publish failed: {:?}", error);
+                                            false
+                                        }
+                                    }
+                                }
+                                None => {
+                                    log::error!(
+                                        "MQTT test publish skipped: payload encoding failed"
+                                    );
+                                    false
+                                }
+                            }
                         }
                         Ok(Err(error)) => {
                             log::error!("MQTT session establishment failed: {:?}", error);
