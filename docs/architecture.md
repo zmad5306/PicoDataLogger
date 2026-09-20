@@ -179,26 +179,10 @@ A successful cross-build cannot prove physical behavior. USB enumeration, I2C wi
 
 ## Security boundary
 
-This design is intentionally a LAN learning implementation:
+This design is intended for a trusted LAN:
 
 - MQTT is plaintext and does not authenticate the broker with TLS.
 - NTP responses are structurally validated but not cryptographically authenticated.
 - Wi-Fi and optional MQTT credentials are embedded in the compiled firmware.
 
 TLS, authenticated time, and protected credential provisioning belong in a separate production-hardening design.
-
-## Important terms
-
-**Compiler target** — The CPU architecture, instruction set, ABI, and execution environment for which Rust generates code.
-
-**`no_std`** — A Rust mode without the OS-oriented `std` crate; the platform-independent `core` crate remains available.
-
-**HAL** — A hardware abstraction layer that exposes typed APIs for peripherals instead of requiring application code to manipulate registers directly.
-
-**Executor** — The runtime component that polls async tasks and wakes them when they can make progress.
-
-**Monotonic clock** — A clock suitable for measuring elapsed time because it does not move backward, but which has no calendar meaning without an external anchor.
-
-**Clock anchor** — A trusted UTC value paired with the monotonic instant at which it was accepted.
-
-**Supervisor** — A long-lived control loop that observes failures, discards invalid state, waits according to retry policy, and recreates the necessary layers.
