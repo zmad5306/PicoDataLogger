@@ -20,6 +20,10 @@ use sht4x::{Precision, Sht4xAsync};
 use static_cell::StaticCell;
 
 const NTP_PORT: u16 = 123;
+const MQTT_TCP_BUFFER_SIZE: usize = 1024;
+const MQTT_TCP_TIMEOUT_SECS: u64 = 10;
+const MQTT_TCP_RETRY_DELAY_SECS: u64 = 10;
+const MQTT_TCP_ATTEMPTS: u8 = 3;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -461,10 +465,15 @@ async fn main(spawner: Spawner) {
 
     connect_wifi(&mut control, &stack, config.wifi_ssid, config.wifi_password).await;
 
-    let _mqtt_address = match resolve_ipv4(stack, config.mqtt_host).await {
+    let mqtt_endpoint = match resolve_ipv4(stack, config.mqtt_host).await {
         Ok(address) => {
-            log::info!("resolved MQTT host {} to {:?}", config.mqtt_host, address);
-            Some(address)
+            let endpoint = embassy_net::IpEndpoint::new(address, config.mqtt_port);
+            log::info!(
+                "resolved MQTT endpoint: host={} endpoint={:?}",
+                config.mqtt_host,
+                endpoint
+            );
+            Some(endpoint)
         }
         Err(error) => {
             error.log(config.mqtt_host);
@@ -491,6 +500,67 @@ async fn main(spawner: Spawner) {
         log::info!("time remains unsynchronized; retrying in 5 seconds");
         Timer::after_secs(5).await;
     };
+
+    let mut mqtt_rx_buffer = [0_u8; MQTT_TCP_BUFFER_SIZE];
+    let mut mqtt_tx_buffer = [0_u8; MQTT_TCP_BUFFER_SIZE];
+
+    if let Some(endpoint) = mqtt_endpoint {
+        for attempt in 1..=MQTT_TCP_ATTEMPTS {
+            let mut mqtt_socket =
+                embassy_net::tcp::TcpSocket::new(stack, &mut mqtt_rx_buffer, &mut mqtt_tx_buffer);
+
+            mqtt_socket.set_timeout(Some(Duration::from_secs(MQTT_TCP_TIMEOUT_SECS)));
+
+            log::info!(
+                "connecting to MQTT endpoint {:?} (attempt {}/{})",
+                endpoint,
+                attempt,
+                MQTT_TCP_ATTEMPTS
+            );
+
+            let connected = match with_timeout(
+                Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
+                mqtt_socket.connect(endpoint),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    log::info!(
+                        "MQTT TCP connected: local={:?} remote={:?}",
+                        mqtt_socket.local_endpoint(),
+                        mqtt_socket.remote_endpoint()
+                    );
+                    true
+                }
+                Ok(Err(error)) => {
+                    log::error!("MQTT TCP connection failed: {:?}", error);
+                    false
+                }
+                Err(_) => {
+                    log::error!(
+                        "MQTT TCP connection timed out after {} seconds",
+                        MQTT_TCP_TIMEOUT_SECS
+                    );
+                    false
+                }
+            };
+
+            if connected {
+                mqtt_socket.close();
+                log::info!("MQTT TCP checkpoint socket closed");
+            }
+
+            drop(mqtt_socket);
+
+            if attempt < MQTT_TCP_ATTEMPTS {
+                log::info!(
+                    "creating a fresh MQTT TCP socket in {} seconds",
+                    MQTT_TCP_RETRY_DELAY_SECS
+                );
+                Timer::after_secs(MQTT_TCP_RETRY_DELAY_SECS).await;
+            }
+        }
+    }
 
     let mut measurement_ticker = Ticker::every(Duration::from_secs(10));
     let mut consecutive_measurements = 0_u32;
