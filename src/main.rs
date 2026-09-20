@@ -6,13 +6,16 @@ use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_rp::bind_interrupts;
+use embassy_rp::clocks::RoscRng;
 use embassy_rp::dma;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::i2c::{Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler};
+use embassy_rp::i2c::{
+    Async as I2cAsync, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler,
+};
 use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
-use embassy_time::{Duration, Instant, Ticker, Timer, with_timeout};
+use embassy_time::{Delay, Duration, Instant, Ticker, Timer, with_timeout};
 use panic_halt as _;
 use pico_data_logger::backoff::RetryBackoff;
 use pico_data_logger::ntp::{
@@ -42,6 +45,7 @@ bind_interrupts!(struct Irqs {
 });
 
 type UsbDriver = Driver<'static, USB>;
+type Sensor = Sht4xAsync<I2c<'static, I2C0, I2cAsync>, Delay>;
 
 struct AppConfig {
     wifi_ssid: &'static str,
@@ -58,6 +62,28 @@ struct AppConfig {
 struct ClockAnchor {
     unix_seconds: u64,
     monotonic: Instant,
+}
+
+struct ClockState {
+    anchor: ClockAnchor,
+    next_refresh_at: Instant,
+    refresh_backoff: RetryBackoff,
+}
+
+struct AppRuntime<'a> {
+    config: &'a AppConfig,
+    stack: embassy_net::Stack<'static>,
+    rng: &'a mut RoscRng,
+    sensor: &'a mut Sensor,
+    delay: &'a mut Delay,
+    started_at: Instant,
+    clock: ClockState,
+    reading_json_buffer: &'a mut [u8; READING_JSON_BUFFER_SIZE],
+}
+
+struct Supervisor<'a> {
+    app: AppRuntime<'a>,
+    control: &'a mut cyw43::Control<'static>,
 }
 
 #[derive(Debug)]
@@ -103,6 +129,16 @@ impl ClockAnchor {
     fn unix_now(&self) -> Result<u64, ClockError> {
         unix_seconds_from_anchor(self.unix_seconds, self.monotonic.elapsed().as_secs())
             .ok_or(ClockError::Overflow)
+    }
+}
+
+impl ClockState {
+    fn new(anchor: ClockAnchor) -> Self {
+        Self {
+            anchor,
+            next_refresh_at: Instant::now() + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS),
+            refresh_backoff: RetryBackoff::new(),
+        }
     }
 }
 
@@ -382,6 +418,428 @@ async fn synchronize_clock(
     clock_anchor
 }
 
+async fn check_sensor(sensor: &mut Sensor, delay: &mut Delay) {
+    match sensor.serial_number(delay).await {
+        Ok(serial) => {
+            log::info!("SHT40 serial number: 0x{:08X}", serial);
+        }
+        Err(sht4x::Error::I2c(error)) => {
+            log::error!("SHT40 I2C error: {:?}", error);
+        }
+        Err(sht4x::Error::Crc) => {
+            log::error!("SHT40 serial number failed CRC validation");
+        }
+        Err(error) => {
+            log::error!("Unexpected SHT40 error: {:?}", error);
+        }
+    }
+}
+
+async fn synchronize_clock_until_ready(
+    stack: embassy_net::Stack<'_>,
+    ntp_host: &str,
+    rng: &mut RoscRng,
+) -> ClockAnchor {
+    loop {
+        log::info!("attempting NTP synchronization");
+
+        match resolve_ipv4(stack, ntp_host).await {
+            Ok(address) => {
+                let request_id = rng.next_u64();
+
+                if let Some(anchor) = synchronize_clock(stack, address, request_id).await {
+                    return anchor;
+                }
+            }
+            Err(error) => {
+                error.log(ntp_host);
+            }
+        }
+
+        log::info!("time remains unsynchronized; retrying in 5 seconds");
+        Timer::after_secs(5).await;
+    }
+}
+
+async fn refresh_clock(
+    clock: &mut ClockState,
+    stack: embassy_net::Stack<'_>,
+    ntp_host: &str,
+    rng: &mut RoscRng,
+) -> bool {
+    let refreshed_anchor = match resolve_ipv4(stack, ntp_host).await {
+        Ok(address) => {
+            let request_id = rng.next_u64();
+            synchronize_clock(stack, address, request_id).await
+        }
+        Err(error) => {
+            error.log(ntp_host);
+            None
+        }
+    };
+
+    match refreshed_anchor {
+        Some(anchor) => {
+            clock.anchor = anchor;
+            clock.refresh_backoff.reset();
+            clock.next_refresh_at = Instant::now() + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS);
+            true
+        }
+        None => {
+            let retry_delay_secs = clock.refresh_backoff.next_delay_secs();
+            clock.next_refresh_at = Instant::now() + Duration::from_secs(retry_delay_secs);
+            log::error!(
+                "UTC refresh failed; retaining last valid anchor and retrying in {} seconds",
+                retry_delay_secs
+            );
+            false
+        }
+    }
+}
+
+async fn capture_reading(
+    sensor: &mut Sensor,
+    delay: &mut Delay,
+    clock: &ClockAnchor,
+    started_at: Instant,
+) -> Option<Reading> {
+    let measurement = match sensor.measure(Precision::High, delay).await {
+        Ok(measurement) => measurement,
+        Err(sht4x::Error::I2c(error)) => {
+            log::error!("SHT40 measurement failed: I2C error {:?}", error);
+            return None;
+        }
+        Err(sht4x::Error::Crc) => {
+            log::error!("SHT40 measurement failed: CRC error");
+            return None;
+        }
+        Err(error) => {
+            log::error!("SHT40 measurement failed {:?}", error);
+            return None;
+        }
+    };
+
+    let Some(temperature_c) = measurement.temperature_celsius().checked_to_num::<f32>() else {
+        log::error!("SHT40 fixed-point temperature conversion failed");
+        return None;
+    };
+    let Some(relative_humidity_pct) = measurement.humidity_percent().checked_to_num::<f32>() else {
+        log::error!("SHT40 fixed-point humidity conversion failed");
+        return None;
+    };
+    let timestamp_unix_s = match clock.unix_now() {
+        Ok(timestamp) => timestamp,
+        Err(error) => {
+            log::error!(
+                "clock arithmetic failed while timestamping measurement: {:?}",
+                error
+            );
+            return None;
+        }
+    };
+
+    let reading = Reading {
+        temperature_c,
+        relative_humidity_pct,
+        timestamp_unix_s,
+        uptime_s: started_at.elapsed().as_secs(),
+    };
+
+    log::info!(
+        "live reading captured: temperature={:.2}°C humidity={:.2}% RH timestamp={} uptime={}",
+        reading.temperature_c,
+        reading.relative_humidity_pct,
+        reading.timestamp_unix_s,
+        reading.uptime_s
+    );
+
+    Some(reading)
+}
+
+fn create_mqtt_session<'buffer>(
+    config: &AppConfig,
+    packet_rx_buffer: &'buffer mut [u8; MQTT_PACKET_RX_BUFFER_SIZE],
+    packet_tx_buffer: &'buffer mut [u8; MQTT_PACKET_TX_BUFFER_SIZE],
+) -> Option<minimq::Session<'buffer>> {
+    let buffers = minimq::Buffers::new(packet_rx_buffer, packet_tx_buffer);
+    let builder = match minimq::ConfigBuilder::new(buffers).client_id(config.mqtt_client_id) {
+        Ok(builder) => builder.keepalive_interval(MQTT_KEEPALIVE_SECS),
+        Err(error) => {
+            log::error!("invalid MQTT client configuration: {:?}", error);
+            return None;
+        }
+    };
+
+    let builder = match (config.mqtt_username, config.mqtt_password) {
+        (Some(username), Some(password)) => match builder.auth(username, password.as_bytes()) {
+            Ok(builder) => builder,
+            Err(error) => {
+                log::error!("invalid MQTT authentication configuration: {:?}", error);
+                return None;
+            }
+        },
+        (None, None) => builder,
+        _ => {
+            log::error!("MQTT username and password must be configured together");
+            return None;
+        }
+    };
+
+    Some(minimq::Session::new(builder))
+}
+
+async fn run_connected_session(
+    runtime: &mut AppRuntime<'_>,
+    connection: &mut minimq::Connection<'_, '_, embassy_net::tcp::TcpSocket<'_>>,
+) {
+    let mut publish_ticker = Ticker::every(Duration::from_secs(PUBLISH_INTERVAL_SECS));
+
+    'publishing: loop {
+        let live_reading = capture_reading(
+            runtime.sensor,
+            runtime.delay,
+            &runtime.clock.anchor,
+            runtime.started_at,
+        )
+        .await;
+
+        let mqtt_payload = match live_reading.as_ref() {
+            Some(reading) => match encode_reading(reading, runtime.reading_json_buffer) {
+                Ok(payload) => {
+                    log::info!("encoded live MQTT payload: {} bytes", payload.len());
+                    Some(payload)
+                }
+                Err(error) => {
+                    log::error!("failed to encode live MQTT payload: {:?}", error);
+                    None
+                }
+            },
+            None => {
+                log::error!("MQTT publish skipped: no valid live reading");
+                None
+            }
+        };
+
+        if let Some(payload) = mqtt_payload {
+            let publication = minimq::Publication::bytes(runtime.config.mqtt_topic, payload);
+
+            match connection.publish(publication).await {
+                Ok(None) => {
+                    log::info!(
+                        "MQTT QoS 0 sensor reading submitted: topic={}",
+                        runtime.config.mqtt_topic
+                    );
+                }
+                Ok(Some(_)) => {
+                    log::error!("MQTT QoS 0 publish unexpectedly returned an operation handle");
+                }
+                Err(error) => {
+                    log::error!("MQTT sensor reading publish failed: {:?}", error);
+                }
+            }
+        }
+
+        if !connection.is_connected() {
+            log::error!("MQTT publishing loop stopped; connection will be retried");
+            break;
+        }
+
+        loop {
+            let utc_refresh_due = loop {
+                match select3(
+                    publish_ticker.next(),
+                    connection.poll(),
+                    Timer::at(runtime.clock.next_refresh_at),
+                )
+                .await
+                {
+                    Either3::First(()) => {
+                        break false;
+                    }
+                    Either3::Second(Ok(Some(_publication))) => {
+                        log::info!("received an unexpected MQTT publication while waiting");
+                    }
+                    Either3::Second(Ok(None)) => {
+                        // Minimq made internal progress, such as keepalive traffic.
+                    }
+                    Either3::Second(Err(error)) => {
+                        log::error!(
+                            "MQTT session service failed while waiting for next sample: {:?}",
+                            error
+                        );
+                        break 'publishing;
+                    }
+                    Either3::Third(()) => {
+                        log::info!("UTC refresh deadline reached");
+                        break true;
+                    }
+                }
+            };
+
+            if !utc_refresh_due {
+                break;
+            }
+
+            if refresh_clock(
+                &mut runtime.clock,
+                runtime.stack,
+                runtime.config.ntp_host,
+                runtime.rng,
+            )
+            .await
+            {
+                log::info!("scheduled UTC clock refresh succeeded");
+            }
+        }
+    }
+}
+
+async fn run_supervisor(
+    supervisor: &mut Supervisor<'_>,
+    mqtt_session: &mut minimq::Session<'_>,
+    mqtt_rx_buffer: &mut [u8; MQTT_TCP_BUFFER_SIZE],
+    mqtt_tx_buffer: &mut [u8; MQTT_TCP_BUFFER_SIZE],
+) -> ! {
+    let Supervisor { app, control } = supervisor;
+    let mut reconnect_backoff = RetryBackoff::new();
+
+    // supervisor
+    loop {
+        let mut network_recovered = false;
+
+        if !app.stack.is_link_up() {
+            log::info!("network link is down; clearing stale Wi-Fi association state");
+            control.leave().await;
+
+            log::info!("returning to Wi-Fi join");
+            connect_wifi(
+                control,
+                &app.stack,
+                app.config.wifi_ssid,
+                app.config.wifi_password,
+            )
+            .await;
+            network_recovered = true;
+        }
+
+        if !app.stack.is_config_up() {
+            log::info!("network link is up; waiting for DHCP configuration");
+
+            match select(app.stack.wait_config_up(), app.stack.wait_link_down()).await {
+                Either::First(()) => {
+                    log::info!("network configuration restored");
+                    network_recovered = true;
+                }
+                Either::Second(()) => {
+                    log::info!("network link dropped while waiting for DHCP");
+                    continue;
+                }
+            }
+        }
+
+        if network_recovered {
+            log::info!("network recovered; attempting UTC resynchronization");
+
+            if refresh_clock(&mut app.clock, app.stack, app.config.ntp_host, app.rng).await {
+                log::info!("UTC clock anchor refreshed after network recovery");
+            }
+        }
+
+        let endpoint = match resolve_ipv4(app.stack, app.config.mqtt_host).await {
+            Ok(address) => {
+                let endpoint = embassy_net::IpEndpoint::new(address, app.config.mqtt_port);
+
+                log::info!(
+                    "resolved MQTT endpoint: host={} endpoint={:?}",
+                    app.config.mqtt_host,
+                    endpoint
+                );
+
+                endpoint
+            }
+            Err(error) => {
+                error.log(app.config.mqtt_host);
+
+                let retry_delay_secs = reconnect_backoff.next_delay_secs();
+
+                log::info!(
+                    "broker DNS unavailable; retrying in {} secs",
+                    retry_delay_secs
+                );
+
+                Timer::after_secs(retry_delay_secs).await;
+                continue;
+            }
+        };
+
+        let mut mqtt_socket =
+            embassy_net::tcp::TcpSocket::new(app.stack, mqtt_rx_buffer, mqtt_tx_buffer);
+
+        mqtt_socket.set_timeout(Some(Duration::from_secs(MQTT_TCP_TIMEOUT_SECS)));
+
+        log::info!("connecting to MQTT endpoint {:?}", endpoint);
+
+        match with_timeout(
+            Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
+            mqtt_socket.connect(endpoint),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                log::info!(
+                    "MQTT TCP connected: local={:?} remote={:?}",
+                    mqtt_socket.local_endpoint(),
+                    mqtt_socket.remote_endpoint()
+                );
+
+                mqtt_socket.set_timeout(None);
+
+                match with_timeout(
+                    Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
+                    mqtt_session.connect(mqtt_socket),
+                )
+                .await
+                {
+                    Ok(Ok(mut connection)) => {
+                        log::info!("MQTT CONNACK accepted: {:?}", connection.connect_event());
+
+                        reconnect_backoff.reset();
+
+                        run_connected_session(app, &mut connection).await;
+                    }
+                    Ok(Err(error)) => {
+                        log::error!("MQTT session establishment failed: {:?}", error);
+                    }
+                    Err(_) => {
+                        log::error!(
+                            "MQTT session establishment timed out after {} seconds",
+                            MQTT_TCP_TIMEOUT_SECS
+                        );
+                    }
+                };
+            }
+            Ok(Err(error)) => {
+                log::error!("MQTT TCP connection failed: {:?}", error);
+            }
+            Err(_) => {
+                log::error!(
+                    "MQTT TCP connection timed out after {} seconds",
+                    MQTT_TCP_TIMEOUT_SECS
+                );
+            }
+        };
+
+        let retry_delay_secs = reconnect_backoff.next_delay_secs();
+
+        log::info!(
+            "creating a fresh MQTT TCP socket in {} seconds",
+            retry_delay_secs
+        );
+
+        Timer::after_secs(retry_delay_secs).await;
+    }
+}
+
 #[embassy_executor::main(
     executor = "embassy_rp::executor::Executor",
     entry = "cortex_m_rt::entry"
@@ -403,8 +861,8 @@ async fn main(spawner: Spawner) {
         Irqs, i2c_config,
     );
 
-    let mut sht40 = Sht4xAsync::<_, embassy_time::Delay>::new(i2c);
-    let mut delay = embassy_time::Delay;
+    let mut sht40: Sensor = Sht4xAsync::new(i2c);
+    let mut delay = Delay;
 
     let fw = aligned_bytes!("../firmware/43439A0.bin");
     let clm = aligned_bytes!("../firmware/43439A0_clm.bin");
@@ -461,20 +919,7 @@ async fn main(spawner: Spawner) {
 
     log::info!("Pico Data Logger v{} starting", env!("CARGO_PKG_VERSION"));
 
-    match sht40.serial_number(&mut delay).await {
-        Ok(serial) => {
-            log::info!("SHT40 serial number: 0x{:08X}", serial);
-        }
-        Err(sht4x::Error::I2c(error)) => {
-            log::error!("SHT40 I2C error: {:?}", error);
-        }
-        Err(sht4x::Error::Crc) => {
-            log::error!("SHT40 serial number failed CRC validation");
-        }
-        Err(error) => {
-            log::error!("Unexpected SHT40 error: {:?}", error);
-        }
-    }
+    check_sensor(&mut sht40, &mut delay).await;
 
     let config = match AppConfig::load() {
         Ok(config) => config,
@@ -489,438 +934,49 @@ async fn main(spawner: Spawner) {
 
     connect_wifi(&mut control, &stack, config.wifi_ssid, config.wifi_password).await;
 
-    let mut clock_anchor = loop {
-        log::info!("attempting NTP synchronization");
-
-        match resolve_ipv4(stack, config.ntp_host).await {
-            Ok(address) => {
-                let request_id = rng.next_u64();
-
-                if let Some(anchor) = synchronize_clock(stack, address, request_id).await {
-                    break anchor;
-                }
-            }
-            Err(error) => {
-                error.log(config.ntp_host);
-            }
-        }
-
-        log::info!("time remains unsynchronized; retrying in 5 seconds");
-        Timer::after_secs(5).await;
-    };
-
-    let mut next_utc_refresh_at = Instant::now() + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS);
-    let mut utc_refresh_backoff = RetryBackoff::new();
+    let clock_anchor = synchronize_clock_until_ready(stack, config.ntp_host, &mut rng).await;
+    let clock = ClockState::new(clock_anchor);
 
     let mut mqtt_rx_buffer = [0_u8; MQTT_TCP_BUFFER_SIZE];
     let mut mqtt_tx_buffer = [0_u8; MQTT_TCP_BUFFER_SIZE];
     let mut mqtt_packet_rx_buffer = [0_u8; MQTT_PACKET_RX_BUFFER_SIZE];
     let mut mqtt_packet_tx_buffer = [0_u8; MQTT_PACKET_TX_BUFFER_SIZE];
 
-    let mqtt_buffers = minimq::Buffers::new(&mut mqtt_packet_rx_buffer, &mut mqtt_packet_tx_buffer);
-
-    let mqtt_config =
-        match minimq::ConfigBuilder::new(mqtt_buffers).client_id(config.mqtt_client_id) {
-            Ok(builder) => Some(builder.keepalive_interval(MQTT_KEEPALIVE_SECS)),
-            Err(error) => {
-                log::error!("invalid MQTT client configuration: {:?}", error);
-                None
-            }
-        };
-
-    let mqtt_config = match (mqtt_config, config.mqtt_username, config.mqtt_password) {
-        (Some(builder), Some(username), Some(password)) => {
-            match builder.auth(username, password.as_bytes()) {
-                Ok(builder) => Some(builder),
-                Err(error) => {
-                    log::error!("invalid MQTT authentication configuration: {:?}", error);
-                    None
-                }
-            }
-        }
-        (Some(builder), None, None) => Some(builder),
-        (Some(_), _, _) => {
-            log::error!("MQTT username and password must be configured together");
-            None
-        }
-        (None, _, _) => None,
-    };
-
     let mut reading_json_buffer = [0_u8; READING_JSON_BUFFER_SIZE];
 
-    let mqtt_session = mqtt_config.map(minimq::Session::new);
+    let mqtt_session = create_mqtt_session(
+        &config,
+        &mut mqtt_packet_rx_buffer,
+        &mut mqtt_packet_tx_buffer,
+    );
 
-    if let Some(mut mqtt_session) = mqtt_session {
-        let mut reconnect_backoff = RetryBackoff::new();
+    let Some(mut mqtt_session) = mqtt_session else {
+        log::error!("MQTT configuration unavailable; supervisor cannot start");
 
-        // supervisor
         loop {
-            let mut network_recovered = false;
-
-            if !stack.is_link_up() {
-                log::info!("network link is down; clearing stale Wi-Fi association state");
-                control.leave().await;
-
-                log::info!("returning to Wi-Fi join");
-                connect_wifi(&mut control, &stack, config.wifi_ssid, config.wifi_password).await;
-                network_recovered = true;
-            }
-
-            if !stack.is_config_up() {
-                log::info!("network link is up; waiting for DHCP configuration");
-
-                match select(stack.wait_config_up(), stack.wait_link_down()).await {
-                    Either::First(()) => {
-                        log::info!("network configuration restored");
-                        network_recovered = true;
-                    }
-                    Either::Second(()) => {
-                        log::info!("network link dropped while waiting for DHCP");
-                        continue;
-                    }
-                }
-            }
-
-            if network_recovered {
-                log::info!("network recovered; attempting UTC resynchronization");
-
-                match resolve_ipv4(stack, config.ntp_host).await {
-                    Ok(address) => {
-                        let request_id = rng.next_u64();
-
-                        match synchronize_clock(stack, address, request_id).await {
-                            Some(refreshed_anchor) => {
-                                clock_anchor = refreshed_anchor;
-                                utc_refresh_backoff.reset();
-                                next_utc_refresh_at =
-                                    Instant::now() + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS);
-                                log::info!("UTC clock anchor refreshed after network recovery");
-                            }
-                            None => {
-                                let retry_delay_secs = utc_refresh_backoff.next_delay_secs();
-                                next_utc_refresh_at =
-                                    Instant::now() + Duration::from_secs(retry_delay_secs);
-                                log::error!(
-                                    "UTC refresh failed after network recovery; retaining last valid anchor and retrying in {} seconds",
-                                    retry_delay_secs
-                                );
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        error.log(config.ntp_host);
-                        let retry_delay_secs = utc_refresh_backoff.next_delay_secs();
-                        next_utc_refresh_at =
-                            Instant::now() + Duration::from_secs(retry_delay_secs);
-                        log::error!(
-                            "UTC refresh unavailable after network recovery; retaining last valid anchor and retrying in {} seconds",
-                            retry_delay_secs
-                        );
-                    }
-                }
-            }
-
-            let endpoint = match resolve_ipv4(stack, config.mqtt_host).await {
-                Ok(address) => {
-                    let endpoint = embassy_net::IpEndpoint::new(address, config.mqtt_port);
-
-                    log::info!(
-                        "resolved MQTT endpoint: host={} endpoint={:?}",
-                        config.mqtt_host,
-                        endpoint
-                    );
-
-                    endpoint
-                }
-                Err(error) => {
-                    error.log(config.mqtt_host);
-
-                    let retry_delay_secs = reconnect_backoff.next_delay_secs();
-
-                    log::info!(
-                        "broker DNS unavailable; retrying in {} secs",
-                        retry_delay_secs
-                    );
-
-                    Timer::after_secs(retry_delay_secs).await;
-                    continue;
-                }
-            };
-
-            let mut mqtt_socket =
-                embassy_net::tcp::TcpSocket::new(stack, &mut mqtt_rx_buffer, &mut mqtt_tx_buffer);
-
-            mqtt_socket.set_timeout(Some(Duration::from_secs(MQTT_TCP_TIMEOUT_SECS)));
-
-            log::info!("connecting to MQTT endpoint {:?}", endpoint);
-
-            match with_timeout(
-                Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
-                mqtt_socket.connect(endpoint),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    log::info!(
-                        "MQTT TCP connected: local={:?} remote={:?}",
-                        mqtt_socket.local_endpoint(),
-                        mqtt_socket.remote_endpoint()
-                    );
-
-                    mqtt_socket.set_timeout(None);
-
-                    match with_timeout(
-                        Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
-                        mqtt_session.connect(mqtt_socket),
-                    )
-                    .await
-                    {
-                        Ok(Ok(mut connection)) => {
-                            log::info!("MQTT CONNACK accepted: {:?}", connection.connect_event());
-
-                            reconnect_backoff.reset();
-
-                            let mut publish_ticker =
-                                Ticker::every(Duration::from_secs(PUBLISH_INTERVAL_SECS));
-
-                            'publishing: loop {
-                                let live_reading = match sht40
-                                    .measure(Precision::High, &mut delay)
-                                    .await
-                                {
-                                    Ok(measurement) => {
-                                        let temperature_c = measurement
-                                            .temperature_celsius()
-                                            .checked_to_num::<f32>();
-                                        let relative_humidity_pct =
-                                            measurement.humidity_percent().checked_to_num::<f32>();
-
-                                        match (temperature_c, relative_humidity_pct) {
-                                            (Some(temperature_c), Some(relative_humidity_pct)) => {
-                                                match clock_anchor.unix_now() {
-                                                    Ok(timestamp_unix_s) => {
-                                                        let uptime_s =
-                                                            started_at.elapsed().as_secs();
-
-                                                        let reading = Reading {
-                                                            temperature_c,
-                                                            relative_humidity_pct,
-                                                            timestamp_unix_s,
-                                                            uptime_s,
-                                                        };
-
-                                                        log::info!(
-                                                            "live reading captured: temperature={:.2}°C humidity={:.2}% RH timestamp={} uptime={}",
-                                                            reading.temperature_c,
-                                                            reading.relative_humidity_pct,
-                                                            reading.timestamp_unix_s,
-                                                            reading.uptime_s
-                                                        );
-
-                                                        Some(reading)
-                                                    }
-                                                    Err(error) => {
-                                                        log::error!(
-                                                            "clock arithmetic failed while timestamping measurement: {:?}",
-                                                            error
-                                                        );
-                                                        None
-                                                    }
-                                                }
-                                            }
-                                            _ => {
-                                                log::error!(
-                                                    "SHT40 fixed-point measurement conversion failed"
-                                                );
-                                                None
-                                            }
-                                        }
-                                    }
-                                    Err(sht4x::Error::I2c(error)) => {
-                                        log::error!(
-                                            "SHT40 measurement failed: I2C error {:?}",
-                                            error
-                                        );
-                                        None
-                                    }
-                                    Err(sht4x::Error::Crc) => {
-                                        log::error!("SHT40 measurement failed: CRC error");
-                                        None
-                                    }
-                                    Err(error) => {
-                                        log::error!("SHT40 measurement failed {:?}", error);
-                                        None
-                                    }
-                                };
-
-                                let mqtt_payload = match live_reading.as_ref() {
-                                    Some(reading) => {
-                                        match encode_reading(reading, &mut reading_json_buffer) {
-                                            Ok(payload) => {
-                                                log::info!(
-                                                    "encoded live MQTT payload: {} bytes",
-                                                    payload.len()
-                                                );
-                                                Some(payload)
-                                            }
-                                            Err(error) => {
-                                                log::error!(
-                                                    "failed to encode live MQTT payload: {:?}",
-                                                    error
-                                                );
-                                                None
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        log::error!("MQTT publish skipped: no valid live reading");
-                                        None
-                                    }
-                                };
-
-                                match mqtt_payload {
-                                    Some(payload) => {
-                                        let publication =
-                                            minimq::Publication::bytes(config.mqtt_topic, payload);
-
-                                        match connection.publish(publication).await {
-                                            Ok(None) => {
-                                                log::info!(
-                                                    "MQTT QoS 0 sensor reading submitted: topic={}",
-                                                    config.mqtt_topic
-                                                );
-                                            }
-                                            Ok(Some(_)) => {
-                                                log::error!(
-                                                    "MQTT QoS 0 publish unexpectedly returned an operation handle"
-                                                );
-                                            }
-                                            Err(error) => {
-                                                log::error!(
-                                                    "MQTT sensor reading publish failed: {:?}",
-                                                    error
-                                                );
-                                            }
-                                        }
-                                    }
-                                    None => {}
-                                };
-
-                                if !connection.is_connected() {
-                                    log::error!(
-                                        "MQTT publishing loop stopped; connection will be retried"
-                                    );
-                                    break;
-                                }
-
-                                loop {
-                                    let utc_refresh_due = loop {
-                                        match select3(
-                                            publish_ticker.next(),
-                                            connection.poll(),
-                                            Timer::at(next_utc_refresh_at),
-                                        )
-                                        .await
-                                        {
-                                            Either3::First(()) => {
-                                                break false;
-                                            }
-                                            Either3::Second(Ok(Some(_publication))) => {
-                                                log::info!(
-                                                    "received an unexpected MQTT publication while waiting"
-                                                );
-                                            }
-                                            Either3::Second(Ok(None)) => {
-                                                // Minimq made internal progress, such as keepalive traffic.
-                                            }
-                                            Either3::Second(Err(error)) => {
-                                                log::error!(
-                                                    "MQTT session service failed while waiting for next sample: {:?}",
-                                                    error
-                                                );
-                                                break 'publishing;
-                                            }
-                                            Either3::Third(()) => {
-                                                log::info!("UTC refresh deadline reached");
-                                                break true;
-                                            }
-                                        }
-                                    };
-
-                                    if !utc_refresh_due {
-                                        break;
-                                    }
-
-                                    let refreshed_anchor =
-                                        match resolve_ipv4(stack, config.ntp_host).await {
-                                            Ok(address) => {
-                                                let request_id = rng.next_u64();
-                                                synchronize_clock(stack, address, request_id).await
-                                            }
-                                            Err(error) => {
-                                                error.log(config.ntp_host);
-                                                None
-                                            }
-                                        };
-
-                                    match refreshed_anchor {
-                                        Some(anchor) => {
-                                            clock_anchor = anchor;
-                                            utc_refresh_backoff.reset();
-                                            next_utc_refresh_at = Instant::now()
-                                                + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS);
-                                            log::info!("scheduled UTC clock refresh succeeded");
-                                        }
-                                        None => {
-                                            let retry_delay_secs =
-                                                utc_refresh_backoff.next_delay_secs();
-                                            next_utc_refresh_at = Instant::now()
-                                                + Duration::from_secs(retry_delay_secs);
-                                            log::error!(
-                                                "scheduled UTC clock refresh failed; retaining last valid anchor and retrying in {} seconds",
-                                                retry_delay_secs
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(Err(error)) => {
-                            log::error!("MQTT session establishment failed: {:?}", error);
-                        }
-                        Err(_) => {
-                            log::error!(
-                                "MQTT session establishment timed out after {} seconds",
-                                MQTT_TCP_TIMEOUT_SECS
-                            );
-                        }
-                    };
-                }
-                Ok(Err(error)) => {
-                    log::error!("MQTT TCP connection failed: {:?}", error);
-                }
-                Err(_) => {
-                    log::error!(
-                        "MQTT TCP connection timed out after {} seconds",
-                        MQTT_TCP_TIMEOUT_SECS
-                    );
-                }
-            };
-
-            let retry_delay_secs = reconnect_backoff.next_delay_secs();
-
-            log::info!(
-                "creating a fresh MQTT TCP socket in {} seconds",
-                retry_delay_secs
-            );
-
-            Timer::after_secs(retry_delay_secs).await;
+            Timer::after_secs(PUBLISH_INTERVAL_SECS).await;
         }
-    }
+    };
 
-    log::error!("MQTT configuration unavailable; supervisor cannot start");
+    let mut supervisor = Supervisor {
+        app: AppRuntime {
+            config: &config,
+            stack,
+            rng: &mut rng,
+            sensor: &mut sht40,
+            delay: &mut delay,
+            started_at,
+            clock,
+            reading_json_buffer: &mut reading_json_buffer,
+        },
+        control: &mut control,
+    };
 
-    loop {
-        Timer::after_secs(PUBLISH_INTERVAL_SECS).await;
-    }
+    run_supervisor(
+        &mut supervisor,
+        &mut mqtt_session,
+        &mut mqtt_rx_buffer,
+        &mut mqtt_tx_buffer,
+    )
+    .await
 }
