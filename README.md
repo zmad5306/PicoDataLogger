@@ -1,12 +1,24 @@
 # Pico Data Logger
 
-A data logger built with:
+Bare-metal Rust firmware that reads temperature and humidity from an SHT40, assigns synchronized UTC timestamps, and publishes JSON readings over MQTT from a Raspberry Pi Pico 2 W.
+
+The firmware is designed to run unattended: it services MQTT between samples, retries transient failures indefinitely with bounded delays, rebuilds stale network state at the appropriate layer, and keeps USB diagnostics active during recovery.
+
+Project documentation:
+
+- This README is the build, deployment, operation, troubleshooting, and acceptance-test runbook.
+- [Architecture](docs/architecture.md) explains the async tasks, hardware interfaces, protocol layers, fixed-memory model, clock anchor, and recovery supervisor.
+- [CYW43439 firmware provenance](firmware/README.md) records the bundled radio firmware source and hashes.
+
+## Hardware
+
+The project uses:
 
 - Raspberry Pi Pico 2 W
 - Adafruit SHT40 temperature and humidity sensor (I2C)
 - Qwiic-compatible cable
 
-## Hardware wiring
+### Hardware wiring
 
 The SHT40 is connected to the Pico 2 W using the following Qwiic wire mapping. Physical pin numbers refer to the numbered pins on the Pico 2 W header.
 
@@ -231,7 +243,7 @@ Reconnect with the newly reported device instead of reusing a stale name from an
 
 ## Runtime architecture
 
-The firmware uses independently scheduled Embassy tasks for USB logging, the CYW43439 radio, and the network stack. The main application owns the SHT40, time synchronization, MQTT session, and recovery supervisor. A blocked or failed network operation therefore does not intentionally stop USB diagnostics or the network driver tasks.
+The firmware uses independently scheduled Embassy tasks for USB logging, the CYW43439 radio, and the network stack. The main application owns the SHT40, time synchronization, MQTT session, and recovery supervisor. A blocked or failed network operation therefore does not intentionally stop USB diagnostics or the network driver tasks. See the [architecture document](docs/architecture.md) for the detailed task, protocol, ownership, and recovery design.
 
 The data path is:
 
@@ -244,7 +256,7 @@ SHT40 over I2C
   -> broker subscriber
 ```
 
-The application does not allocate a new JSON or network buffer for every reading. Its sensor, JSON, TCP, and MQTT packet buffers have fixed sizes and are reused. See [docs/architecture.md](docs/architecture.md) for the hardware and Embassy layers beneath the application.
+The application does not allocate a new JSON or network buffer for every reading. Its JSON, UDP, TCP, and MQTT packet buffers have fixed sizes and are reused.
 
 ## Normal operation
 
@@ -303,13 +315,13 @@ Publications use MQTT QoS 0 and are not retained. Submission means the client ha
 
 ## Recovery behavior
 
-The application is supervised indefinitely rather than stopping after a fixed number of attempts. Connection retries use delays of 1, 2, 4, 8, 16, 32, and then at most 60 seconds. A successful MQTT connection resets that connection backoff.
+The application is supervised indefinitely rather than stopping after a fixed number of attempts. MQTT reconnection and UTC-refresh retries use delays of 1, 2, 4, 8, 16, 32, and then at most 60 seconds. Successful recovery resets the applicable backoff. Wi-Fi join attempts have a 15-second timeout and retry after five seconds.
 
 Recovery discards state from the failed layer upward:
 
 - A failed SHT40 read skips one publication and retries at the next 60-second sample without dropping a healthy MQTT session.
 - A broker DNS, TCP, MQTT handshake, publish, keepalive, or disconnect failure drops the MQTT connection and TCP socket. The next attempt resolves the broker again and creates fresh transport state.
-- A lost Wi-Fi link returns to Wi-Fi join and DHCP before DNS, NTP, TCP, and MQTT are rebuilt.
+- A lost Wi-Fi link explicitly clears stale CYW43439 association state, then returns to Wi-Fi join and DHCP before DNS, NTP, TCP, and MQTT are rebuilt.
 - A UTC refresh failure retains the last valid clock anchor and retries with the same bounded-backoff policy. A successful refresh resets that backoff and schedules the next daily refresh.
 
 The USB logger remains a separate task throughout these paths, so the serial log should continue reporting recovery transitions while the application waits.

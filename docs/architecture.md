@@ -1,130 +1,189 @@
-# Embedded Architecture
+# Pico Data Logger Architecture
 
-## 1. Bare-Metal and `no_std`
+PicoDataLogger is bare-metal Rust firmware for a Raspberry Pi Pico 2 W. It reads an SHT40 sensor, establishes UTC with NTP, encodes readings as JSON, and publishes them to MQTT while recovering from ordinary sensor and network failures.
 
-PicoDataLogger runs **bare-metal** on the RP2350. There is no conventional operating system underneath the firmware: no OS processes, virtual memory, system calls, or OS-managed threads.
+The [README](../README.md) is the operational runbook for wiring, configuration, flashing, monitoring, and fault testing. This document explains how the firmware is structured internally.
 
-The firmware is compiled with:
+## Platform and execution model
+
+The firmware targets the RP2350A's Arm Cortex-M33 cores with `thumbv8m.main-none-eabihf` and is compiled with:
 
 ```rust
 #![no_std]
+#![no_main]
 ```
 
-`#![no_std]` means Rust's normal `std` library is not linked. It does **not** mean Rust has no standard language/runtime facilities.
+There is no conventional operating system: no processes, OS threads, virtual memory, filesystem, or OS socket API. The `core` crate still provides language fundamentals such as `Option`, `Result`, slices, iterators, and traits. This firmware does not configure a heap allocator; long-lived storage and protocol buffers have fixed sizes.
 
-The `core` crate remains available and provides fundamental Rust functionality including:
-
-- Primitive types
-- `Option` and `Result`
-- Slices
-- Iterators
-- Formatting traits
-- Basic memory and pointer operations
-- Core language traits such as `Copy`, `Clone`, and `Iterator`
-
-The `alloc` crate can optionally provide heap-backed types such as `Vec`, `String`, and `Box`, but only when the firmware configures an allocator.
-
-There is no operating system providing services such as files, processes, sockets, or threads. Hardware access and concurrency are instead provided directly by the firmware, Embassy, hardware peripherals, and interrupts.
-
----
-
-## 2. Embassy Stack
-
-PicoDataLogger uses Embassy to provide an asynchronous programming model on top of the RP2350A hardware without requiring an operating system.
-
-The RP2350A provides:
-
-- **2 × Arm Cortex-M33 cores** running at up to **150 MHz**
-- Hardware single-precision floating point and DSP instructions
-- **520 kB of on-chip SRAM** across 10 independent banks
-- **8 kB of one-time-programmable (OTP) storage**
-- No internal flash; program storage is provided by external QSPI flash
-
-On the Pico 2 W, the RP2350A is paired with **4 MB of external QSPI flash**.
+Embassy supplies the asynchronous executor, hardware abstraction layer, timers, and network stack. Async tasks yield while waiting for hardware, network traffic, or deadlines, allowing other firmware tasks to run without OS threads.
 
 ```mermaid
 flowchart TD
-    APP["Application<br/>tasks and application logic"]
-    EXEC["Embassy Executor<br/>async task scheduling"]
-    HAL["embassy-rp HAL<br/>GPIO / I2C / SPI / UART / DMA / Timers"]
-    HW["RP2350A Hardware<br/>2 × Cortex-M33 @ 150 MHz<br/>520 kB SRAM<br/>Peripherals"]
-    FLASH["External QSPI Flash<br/>4 MB on Pico 2 W"]
+    APP["Application state machine"]
+    TASKS["Embassy executor and async tasks"]
+    SERVICES["embassy-net / drivers / timers"]
+    HAL["embassy-rp HAL"]
+    RP["RP2350A hardware"]
+    FLASH["4 MB external QSPI flash"]
 
-    APP --> EXEC
-    EXEC --> HAL
-    HAL --> HW
-    HW <--> FLASH
+    APP --> TASKS
+    TASKS --> SERVICES
+    SERVICES --> HAL
+    HAL --> RP
+    RP <--> FLASH
 ```
 
-The **application** contains the device's behavior and asynchronous tasks.
+The RP2350A provides two Cortex-M33 cores, 520 kB of SRAM, hardware floating point, and the peripherals used by the firmware. The Pico 2 W board supplies external QSPI flash for program storage and a CYW43439 radio for Wi-Fi.
 
-The **Embassy executor** runs those async tasks, wakes them when events occur, and can allow the CPU to sleep when no task has work to perform.
+## Runtime tasks
 
-The **`embassy-rp` HAL** exposes Rust APIs for configuring and controlling RP2350A hardware such as GPIO, I2C, SPI, timers, and DMA.
+Four long-lived async execution paths cooperate on the Embassy executor:
 
-At the bottom is the **RP2350A hardware** itself. The chip contains two Arm Cortex-M33 CPU cores, 520 kB of SRAM, and the hardware peripherals controlled by the HAL. HAL operations ultimately become CPU instructions that read and write memory-mapped hardware registers.
+| Execution path | Responsibility |
+| --- | --- |
+| USB logger task | Runs USB CDC logging independently of application recovery. |
+| CYW43439 runner | Services communication with the Wi-Fi radio. |
+| `embassy-net` runner | Drives DHCP, DNS, UDP, and TCP network progress. |
+| Main application | Owns the SHT40, clock anchor, MQTT session, fixed buffers, sampling schedule, and recovery supervisor. |
 
-The RP2350A does not contain flash memory. The Pico 2 W board provides **4 MB of external QSPI flash**, which stores the firmware image and other nonvolatile data.
+The logger and network runners are spawned before the main application begins joining Wi-Fi. A failed sensor read, NTP request, or MQTT connection therefore does not intentionally stop USB diagnostics or the lower-level network drivers.
 
----
+## Hardware connections
 
-## 3. External Devices
+The SHT40 uses the RP2350's I2C0 peripheral. These assignments are part of the project contract and must remain unchanged:
 
-The CYW43439 radio and SHT40 sensor are external devices connected to the RP2350. They sit beside the main software stack rather than forming additional layers underneath it.
+| SHT40 signal | Pico 2 W connection | Physical pin |
+| --- | --- | ---: |
+| VCC | 3V3 OUT | 36 |
+| GND | GND | 3 |
+| SDA | GP0 / I2C0 SDA | 1 |
+| SCL | GP1 / I2C0 SCL | 2 |
+
+The CYW43439 is a separate radio chip. The RP2350 communicates with it through the `cyw43` driver using a PIO-backed SPI bus and DMA. To the application, the radio becomes an `embassy-net` network device rather than an operating-system interface.
 
 ```mermaid
 flowchart LR
-    FW["Application<br/>↓<br/>Embassy Executor<br/>↓<br/>embassy-rp HAL"]
-    RP["RP2350 Hardware"]
-    RADIO["CYW43439<br/>Wi-Fi / Bluetooth"]
-    SHT["SHT40<br/>Temperature / Humidity"]
-
-    FW --> RP
-    RP <--> RADIO
-    RP <-->|"I2C0"| SHT
+    SHT["SHT40"] <-->|"I2C0: GP0/GP1"| RP["RP2350A"]
+    RP <-->|"PIO SPI + DMA"| RADIO["CYW43439"]
+    RADIO <-->|"Wi-Fi"| LAN["LAN / Internet"]
 ```
 
-### SHT40
+## Data and protocol flow
 
-The SHT40 temperature and humidity sensor is connected using the RP2350's **I2C0** peripheral:
-
-| SHT40 | RP2350 |
-|---|---|
-| SDA | GP0 / I2C0 SDA |
-| SCL | GP1 / I2C0 SCL |
-| VCC | 3V3 |
-| GND | GND |
-
-Application code communicates with the SHT40 through its driver, which uses the `embassy-rp` I2C implementation to operate the RP2350's I2C0 peripheral.
-
-### CYW43439
-
-The CYW43439 is a separate Wi-Fi/Bluetooth radio chip. The RP2350 communicates with it through hardware interfaces and a driver rather than through an operating-system network device.
-
-Both devices ultimately interact with application code through roughly the same pattern:
+A successful reading crosses several distinct layers:
 
 ```mermaid
 flowchart LR
-    APP["Application"] --> DRIVER["Device Driver"]
-    DRIVER --> HAL["embassy-rp HAL"]
-    HAL --> RP["RP2350 Hardware"]
-    RP <--> DEVICE["External Device"]
+    SENSOR["SHT40 measurement"]
+    READING["Reading + UTC + uptime"]
+    JSON["JSON buffer"]
+    MQTT["MQTT publication"]
+    TCP["TCP stream"]
+    WIFI["Wi-Fi"]
+    BROKER["MQTT broker"]
+
+    SENSOR --> READING --> JSON --> MQTT --> TCP --> WIFI --> BROKER
 ```
 
----
+- I2C transports sensor commands and measurements.
+- `Reading` gives the measurement a typed representation.
+- `serde-json-core` serializes into caller-owned fixed storage.
+- MQTT defines the topic, publication, session, and keepalive behavior.
+- TCP provides MQTT with an ordered byte stream.
+- Wi-Fi carries IP traffic to the configured broker.
 
-## 4. Important Terms
+MQTT publications use QoS 0 and are not retained. Successful submission does not prove that a subscriber consumed the message.
 
-**Compiler target** — Defines the CPU architecture, instruction set, ABI, and execution environment for which Rust generates machine code.
+## Time model
 
-**`no_std`** — A Rust compilation mode where the `std` crate is unavailable; the platform-independent `core` crate remains available, and `alloc` can optionally be used when an allocator is provided.
+Embassy's `Instant` is monotonic: it measures elapsed time but has no relationship to a calendar epoch. NTP supplies whole UTC seconds, which the firmware stores beside `Instant::now()` as a clock anchor:
 
-**`core`** — Rust's platform-independent foundational library providing primitive types and operations, `Option`, `Result`, slices, iterators, formatting traits, and other functionality that does not require operating-system services.
+```text
+current Unix time = anchored Unix time + monotonic elapsed seconds
+```
 
-**HAL** — A Hardware Abstraction Layer provides Rust APIs for controlling hardware peripherals without requiring application code to manipulate hardware registers directly.
+The firmware validates the NTP packet before accepting its timestamp, including its length, server mode, leap indicator, stratum, and request/originate timestamp relationship. Checked arithmetic rejects timestamps before the Unix epoch and detects anchor overflow.
 
-**Executor** — A runtime component that runs asynchronous tasks, wakes tasks when they can make progress, and determines what code should execute next without requiring OS threads.
+Startup does not proceed to MQTT until the first valid anchor exists. Later refresh failures retain the last valid anchor rather than replacing UTC with uptime. Refresh occurs after network recovery and at least daily; failures retry with bounded backoff.
 
-**Interrupt** — A hardware-generated event that temporarily redirects CPU execution to an interrupt handler so an event can be serviced promptly.
+## Fixed memory and ownership
 
-**Firmware image** — The compiled binary containing the program and associated data that is written to the device's nonvolatile memory and executed when the processor boots.
+The firmware reuses fixed-size storage instead of allocating per operation:
+
+| Buffer | Size | Purpose |
+| --- | ---: | --- |
+| Reading JSON | 128 bytes | Serialized sensor payload. |
+| TCP receive | 1024 bytes | MQTT transport input. |
+| TCP transmit | 1024 bytes | MQTT transport output. |
+| MQTT packet receive | 512 bytes | MQTT decoder storage. |
+| MQTT packet transmit | 1024 bytes | MQTT encoder storage. |
+| NTP receive | 512 bytes | UDP response storage. |
+| NTP transmit | 48 bytes | One NTP request. |
+
+Rust ownership keeps those buffers from being reused while an async operation still borrows them. The JSON encoder returns a slice whose lifetime is tied to the caller's buffer, preventing that slice from outliving its storage. Encoding and clock arithmetic return explicit errors rather than panicking on undersized storage or overflow.
+
+## Recovery supervisor
+
+After configuration and initial UTC synchronization, the main application runs a forever supervisor:
+
+```mermaid
+flowchart TD
+    READY{"Wi-Fi link and DHCP ready?"}
+    JOIN["Clear stale association<br/>join Wi-Fi<br/>wait for DHCP"]
+    TIME["Refresh UTC after recovery"]
+    DNS["Resolve broker"]
+    TCP["Create fresh TCP socket"]
+    MQTT["Create MQTT connection"]
+    RUN["Measure, publish, and service MQTT"]
+    WAIT["Bounded retry delay"]
+
+    READY -->|No| JOIN --> TIME --> DNS
+    READY -->|Yes| DNS
+    DNS -->|Success| TCP -->|Success| MQTT -->|Success| RUN
+    DNS -->|Failure| WAIT
+    TCP -->|Failure| WAIT
+    MQTT -->|Failure| WAIT
+    RUN -->|Transport or broker failure| WAIT
+    WAIT --> READY
+```
+
+Recovery follows the failed layer:
+
+- A sensor error skips one sample but preserves a healthy MQTT connection.
+- DNS, TCP, MQTT handshake, publish, keepalive, or disconnect failures discard the MQTT connection and TCP socket. The next attempt re-resolves DNS and creates fresh transport state.
+- Link loss clears stale CYW43439 association state, rejoins Wi-Fi with a bounded attempt, waits for DHCP, and then rebuilds time and broker state.
+- MQTT reconnection and UTC refresh delays grow through 1, 2, 4, 8, 16, 32, and 60 seconds, then remain capped. Successful recovery resets the applicable backoff.
+
+Only invalid compile-time application configuration reaches the deliberate parked diagnostic state. Runtime network and service failures continue retrying.
+
+## Verification boundary
+
+Host tests cover pure logic such as JSON encoding, retry progression, NTP packet validation, epoch conversion, and checked timestamp derivation. CI also checks formatting, Clippy, and a release cross-build for the Pico target.
+
+A successful cross-build cannot prove physical behavior. USB enumeration, I2C wiring, SHT40 reads, CYW43439 association, DHCP, real NTP traffic, and MQTT delivery require the hardware checks documented in the README.
+
+## Security boundary
+
+This design is intentionally a LAN learning implementation:
+
+- MQTT is plaintext and does not authenticate the broker with TLS.
+- NTP responses are structurally validated but not cryptographically authenticated.
+- Wi-Fi and optional MQTT credentials are embedded in the compiled firmware.
+
+TLS, authenticated time, and protected credential provisioning belong in a separate production-hardening design.
+
+## Important terms
+
+**Compiler target** — The CPU architecture, instruction set, ABI, and execution environment for which Rust generates code.
+
+**`no_std`** — A Rust mode without the OS-oriented `std` crate; the platform-independent `core` crate remains available.
+
+**HAL** — A hardware abstraction layer that exposes typed APIs for peripherals instead of requiring application code to manipulate registers directly.
+
+**Executor** — The runtime component that polls async tasks and wakes them when they can make progress.
+
+**Monotonic clock** — A clock suitable for measuring elapsed time because it does not move backward, but which has no calendar meaning without an external anchor.
+
+**Clock anchor** — A trusted UTC value paired with the monotonic instant at which it was accepted.
+
+**Supervisor** — A long-lived control loop that observes failures, discards invalid state, waits according to retry policy, and recreates the necessary layers.
