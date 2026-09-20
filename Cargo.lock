@@ -273,8 +273,6 @@ dependencies = [
 [[package]]
 name = "cyw43"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "033e856bf6f38c96fee3e3f398cceff0ca2c2fae5db255bcd23495216c7047da"
 dependencies = [
  "aligned",
  "cortex-m",

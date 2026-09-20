@@ -3,6 +3,7 @@
 pub mod backoff;
 pub mod flash_queue;
 pub mod ntp;
+pub mod status;
 
 /// A sensor measurement with its collection time and device uptime.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]

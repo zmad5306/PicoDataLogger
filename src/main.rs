@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+use core::future::Future;
+use core::pin::pin;
 use cyw43::aligned_bytes;
 use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use embassy_executor::Spawner;
@@ -24,6 +26,7 @@ use pico_data_logger::ntp::{
     NTP_PACKET_LEN, build_ntp_request, ntp_to_unix_seconds, unix_seconds_from_anchor,
     validate_ntp_response,
 };
+use pico_data_logger::status::{LedStatus, LedStatusModel};
 use pico_data_logger::{Reading, compose_mqtt_client_id, encode_reading, format_hardware_id};
 use sht4x::{Precision, Sht4xAsync};
 use static_cell::StaticCell;
@@ -42,6 +45,8 @@ const MQTT_EFFECTIVE_CLIENT_ID_SIZE: usize = 96;
 const FLASH_SIZE: usize = 4 * 1024 * 1024;
 const STORAGE_OFFSET: u32 = 0x003c_0000;
 const STORAGE_LENGTH: u32 = 256 * 1024;
+const LED_GPIO: u8 = 0;
+const FAULT_FLASH_INTERVAL_MS: u64 = 100;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -94,6 +99,71 @@ struct AppRuntime<'a> {
 struct Supervisor<'a> {
     app: AppRuntime<'a>,
     control: &'a mut cyw43::Control<'static>,
+    led: LedStatusModel,
+}
+
+async fn show_led_status(
+    control: &mut cyw43::Control<'_>,
+    led: &mut LedStatusModel,
+    status: LedStatus,
+) {
+    led.transition(status);
+    control.gpio_set(LED_GPIO, led.is_on()).await;
+}
+
+async fn tick_fault_led(control: &mut cyw43::Control<'_>, led: &mut LedStatusModel) {
+    led.tick();
+    control.gpio_set(LED_GPIO, led.is_on()).await;
+}
+
+async fn flash_fault_forever(control: &mut cyw43::Control<'_>, led: &mut LedStatusModel) -> ! {
+    show_led_status(control, led, LedStatus::Fault).await;
+    loop {
+        Timer::after_millis(FAULT_FLASH_INTERVAL_MS).await;
+        tick_fault_led(control, led).await;
+    }
+}
+
+async fn flash_fault_for(
+    control: &mut cyw43::Control<'_>,
+    led: &mut LedStatusModel,
+    duration: Duration,
+) {
+    let deadline = Instant::now() + duration;
+    show_led_status(control, led, LedStatus::Fault).await;
+    while Instant::now() < deadline {
+        match select(
+            Timer::at(deadline),
+            Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
+        )
+        .await
+        {
+            Either::First(()) => break,
+            Either::Second(()) => tick_fault_led(control, led).await,
+        }
+    }
+}
+
+/// Keep an in-flight startup/recovery operation alive while advancing the
+/// fault LED. Re-borrowing the pinned future is important: a timer tick must
+/// not cancel and restart DHCP, DNS, NTP, TCP, or MQTT work.
+async fn await_with_fault_flash<F: Future>(
+    future: F,
+    control: &mut cyw43::Control<'_>,
+    led: &mut LedStatusModel,
+) -> F::Output {
+    let mut future = pin!(future);
+    loop {
+        match select(
+            future.as_mut(),
+            Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
+        )
+        .await
+        {
+            Either::First(output) => return output,
+            Either::Second(()) => tick_fault_led(control, led).await,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -208,6 +278,7 @@ async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'sta
 
 async fn connect_wifi(
     control: &mut cyw43::Control<'_>,
+    led: &mut LedStatusModel,
     stack: &embassy_net::Stack<'_>,
     ssid: &str,
     password: &str,
@@ -223,7 +294,13 @@ async fn connect_wifi(
 
         match select(
             Timer::after_secs(WIFI_JOIN_TIMEOUT_SECS),
-            control.join(ssid, join_options),
+            control.join_with_gpio_flash(
+                ssid,
+                join_options,
+                LED_GPIO,
+                Duration::from_millis(FAULT_FLASH_INTERVAL_MS),
+                led.is_on(),
+            ),
         )
         .await
         {
@@ -233,25 +310,28 @@ async fn connect_wifi(
                     WIFI_JOIN_TIMEOUT_SECS
                 );
                 control.leave().await;
+                show_led_status(control, led, LedStatus::Fault).await;
             }
             Either::Second(Ok(())) => {
                 log::info!("joined configured Wi-Fi network");
+                show_led_status(control, led, LedStatus::Fault).await;
                 break;
             }
             Either::Second(Err(error)) => {
                 log::error!("Wi-Fi join failed: {:?}", error);
+                show_led_status(control, led, LedStatus::Fault).await;
             }
         }
 
         log::info!("retrying Wi-Fi join in 5 seconds");
-        Timer::after_secs(5).await;
+        flash_fault_for(control, led, Duration::from_secs(5)).await;
     }
 
     log::info!("waiting for network link");
-    stack.wait_link_up().await;
+    await_with_fault_flash(stack.wait_link_up(), control, led).await;
     log::info!("network link up; waiting for DHCP");
 
-    stack.wait_config_up().await;
+    await_with_fault_flash(stack.wait_config_up(), control, led).await;
 
     match stack.config_v4() {
         Some(ipv4_config) => {
@@ -428,19 +508,23 @@ async fn synchronize_clock(
     clock_anchor
 }
 
-async fn check_sensor(sensor: &mut Sensor, delay: &mut Delay) {
+async fn check_sensor(sensor: &mut Sensor, delay: &mut Delay) -> bool {
     match sensor.serial_number(delay).await {
         Ok(serial) => {
             log::info!("SHT40 serial number: 0x{:08X}", serial);
+            true
         }
         Err(sht4x::Error::I2c(error)) => {
             log::error!("SHT40 I2C error: {:?}", error);
+            false
         }
         Err(sht4x::Error::Crc) => {
             log::error!("SHT40 serial number failed CRC validation");
+            false
         }
         Err(error) => {
             log::error!("Unexpected SHT40 error: {:?}", error);
+            false
         }
     }
 }
@@ -449,15 +533,23 @@ async fn synchronize_clock_until_ready(
     stack: embassy_net::Stack<'_>,
     ntp_host: &str,
     rng: &mut RoscRng,
+    control: &mut cyw43::Control<'_>,
+    led: &mut LedStatusModel,
 ) -> ClockAnchor {
     loop {
         log::info!("attempting NTP synchronization");
 
-        match resolve_ipv4(stack, ntp_host).await {
+        match await_with_fault_flash(resolve_ipv4(stack, ntp_host), control, led).await {
             Ok(address) => {
                 let request_id = rng.next_u64();
 
-                if let Some(anchor) = synchronize_clock(stack, address, request_id).await {
+                if let Some(anchor) = await_with_fault_flash(
+                    synchronize_clock(stack, address, request_id),
+                    control,
+                    led,
+                )
+                .await
+                {
                     return anchor;
                 }
             }
@@ -467,7 +559,7 @@ async fn synchronize_clock_until_ready(
         }
 
         log::info!("time remains unsynchronized; retrying in 5 seconds");
-        Timer::after_secs(5).await;
+        flash_fault_for(control, led, Duration::from_secs(5)).await;
     }
 }
 
@@ -572,7 +664,13 @@ async fn capture_reading<'a>(
     Some(reading)
 }
 
-async fn capture_and_enqueue(runtime: &mut AppRuntime<'_>) {
+async fn capture_and_enqueue(
+    runtime: &mut AppRuntime<'_>,
+    control: &mut cyw43::Control<'_>,
+    led: &mut LedStatusModel,
+) -> bool {
+    // A new sample attempt temporarily takes priority over a previous fault.
+    show_led_status(control, led, LedStatus::Publishing).await;
     let sequence = runtime.queue.next_sequence();
     let reading = capture_reading(
         runtime.sensor,
@@ -586,7 +684,10 @@ async fn capture_and_enqueue(runtime: &mut AppRuntime<'_>) {
     .await;
     runtime.next_sample_at += Duration::from_secs(PUBLISH_INTERVAL_SECS);
 
-    let Some(reading) = reading else { return };
+    let Some(reading) = reading else {
+        show_led_status(control, led, LedStatus::Fault).await;
+        return false;
+    };
     let previous_dropped = runtime.queue.dropped();
     match runtime.queue.append(
         reading.timestamp_unix_s,
@@ -604,8 +705,13 @@ async fn capture_and_enqueue(runtime: &mut AppRuntime<'_>) {
                 runtime.queue.depth(),
                 runtime.queue.capacity()
             );
+            true
         }
-        Err(error) => log::error!("failed to persist measurement: {:?}", error),
+        Err(error) => {
+            log::error!("failed to persist measurement: {:?}", error);
+            show_led_status(control, led, LedStatus::Fault).await;
+            false
+        }
     }
 }
 
@@ -627,11 +733,13 @@ fn queued_reading<'a>(
 
 async fn drain_queue(
     runtime: &mut AppRuntime<'_>,
+    control: &mut cyw43::Control<'_>,
+    led: &mut LedStatusModel,
     connection: &mut minimq::Connection<'_, '_, embassy_net::tcp::TcpSocket<'_>>,
 ) -> bool {
     loop {
         while runtime.next_sample_at <= Instant::now() {
-            capture_and_enqueue(runtime).await;
+            capture_and_enqueue(runtime, control, led).await;
         }
         let record = match runtime.queue.peek_oldest() {
             Ok(Some(record)) => record,
@@ -641,6 +749,7 @@ async fn drain_queue(
                 return false;
             }
         };
+        show_led_status(control, led, LedStatus::Publishing).await;
         let reading = queued_reading(record, runtime.config.mqtt_client_id, runtime.hardware_id);
         let payload = match encode_reading(&reading, runtime.reading_json_buffer) {
             Ok(payload) => payload,
@@ -669,7 +778,9 @@ async fn drain_queue(
                     log::error!("MQTT failed while awaiting PUBACK: {:?}", error);
                     return false;
                 }
-                Either::Second(()) => capture_and_enqueue(runtime).await,
+                Either::Second(()) => {
+                    capture_and_enqueue(runtime, control, led).await;
+                }
             }
         }
         if !connection.is_complete(&operation) {
@@ -687,26 +798,54 @@ async fn drain_queue(
                 return false;
             }
         }
-    }
-}
-
-async fn wait_with_sampling(runtime: &mut AppRuntime<'_>, duration: Duration) {
-    let deadline = Instant::now() + duration;
-    loop {
-        match select(Timer::at(deadline), Timer::at(runtime.next_sample_at)).await {
-            Either::First(()) => return,
-            Either::Second(()) => capture_and_enqueue(runtime).await,
+        if runtime.queue.depth() == 0 {
+            show_led_status(control, led, LedStatus::Idle).await;
         }
     }
 }
 
-async fn recover_wifi_with_sampling(app: &mut AppRuntime<'_>, control: &mut cyw43::Control<'_>) {
+async fn wait_with_sampling(
+    runtime: &mut AppRuntime<'_>,
+    control: &mut cyw43::Control<'_>,
+    led: &mut LedStatusModel,
+    duration: Duration,
+) {
+    let deadline = Instant::now() + duration;
+    loop {
+        match select3(
+            Timer::at(deadline),
+            Timer::at(runtime.next_sample_at),
+            Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
+        )
+        .await
+        {
+            Either3::First(()) => return,
+            Either3::Second(()) => {
+                capture_and_enqueue(runtime, control, led).await;
+                show_led_status(control, led, LedStatus::Fault).await;
+            }
+            Either3::Third(()) => tick_fault_led(control, led).await,
+        }
+    }
+}
+
+async fn recover_wifi_with_sampling(
+    app: &mut AppRuntime<'_>,
+    control: &mut cyw43::Control<'_>,
+    led: &mut LedStatusModel,
+) {
     loop {
         let mut join_options = cyw43::JoinOptions::new(app.config.wifi_password.as_bytes());
         join_options.auth = cyw43::JoinAuth::Wpa2;
         match select3(
             Timer::after_secs(WIFI_JOIN_TIMEOUT_SECS),
-            control.join(app.config.wifi_ssid, join_options),
+            control.join_with_gpio_flash(
+                app.config.wifi_ssid,
+                join_options,
+                LED_GPIO,
+                Duration::from_millis(FAULT_FLASH_INTERVAL_MS),
+                led.is_on(),
+            ),
             Timer::at(app.next_sample_at),
         )
         .await
@@ -715,26 +854,50 @@ async fn recover_wifi_with_sampling(app: &mut AppRuntime<'_>, control: &mut cyw4
                 log::error!("Wi-Fi recovery join timed out");
                 control.leave().await;
             }
-            Either3::Second(Ok(())) => break,
+            Either3::Second(Ok(())) => {
+                show_led_status(control, led, LedStatus::Fault).await;
+                break;
+            }
             Either3::Second(Err(error)) => log::error!("Wi-Fi recovery join failed: {:?}", error),
             Either3::Third(()) => {
-                capture_and_enqueue(app).await;
+                capture_and_enqueue(app, control, led).await;
+                show_led_status(control, led, LedStatus::Fault).await;
                 continue;
             }
         }
-        wait_with_sampling(app, Duration::from_secs(5)).await;
+        wait_with_sampling(app, control, led, Duration::from_secs(5)).await;
     }
 
     while !app.stack.is_link_up() {
-        match select(app.stack.wait_link_up(), Timer::at(app.next_sample_at)).await {
-            Either::First(()) => {}
-            Either::Second(()) => capture_and_enqueue(app).await,
+        match select3(
+            app.stack.wait_link_up(),
+            Timer::at(app.next_sample_at),
+            Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
+        )
+        .await
+        {
+            Either3::First(()) => {}
+            Either3::Second(()) => {
+                capture_and_enqueue(app, control, led).await;
+                show_led_status(control, led, LedStatus::Fault).await;
+            }
+            Either3::Third(()) => tick_fault_led(control, led).await,
         }
     }
     while !app.stack.is_config_up() {
-        match select(app.stack.wait_config_up(), Timer::at(app.next_sample_at)).await {
-            Either::First(()) => {}
-            Either::Second(()) => capture_and_enqueue(app).await,
+        match select3(
+            app.stack.wait_config_up(),
+            Timer::at(app.next_sample_at),
+            Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
+        )
+        .await
+        {
+            Either3::First(()) => {}
+            Either3::Second(()) => {
+                capture_and_enqueue(app, control, led).await;
+                show_led_status(control, led, LedStatus::Fault).await;
+            }
+            Either3::Third(()) => tick_fault_led(control, led).await,
         }
     }
     log::info!("Wi-Fi and DHCP recovered");
@@ -775,10 +938,13 @@ fn create_mqtt_session<'buffer>(
 
 async fn run_connected_session(
     runtime: &mut AppRuntime<'_>,
+    control: &mut cyw43::Control<'_>,
+    led: &mut LedStatusModel,
     connection: &mut minimq::Connection<'_, '_, embassy_net::tcp::TcpSocket<'_>>,
 ) {
     'publishing: loop {
-        if !drain_queue(runtime, connection).await {
+        if !drain_queue(runtime, control, led, connection).await {
+            show_led_status(control, led, LedStatus::Fault).await;
             break 'publishing;
         }
 
@@ -786,27 +952,35 @@ async fn run_connected_session(
             let utc_refresh_due = loop {
                 match select3(
                     Timer::at(runtime.next_sample_at),
-                    connection.poll(),
+                    select(
+                        connection.poll(),
+                        Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
+                    ),
                     Timer::at(runtime.clock.next_refresh_at),
                 )
                 .await
                 {
                     Either3::First(()) => {
-                        capture_and_enqueue(runtime).await;
+                        capture_and_enqueue(runtime, control, led).await;
                         break false;
                     }
-                    Either3::Second(Ok(Some(_publication))) => {
+                    Either3::Second(Either::First(Ok(Some(_publication)))) => {
                         log::info!("received an unexpected MQTT publication while waiting");
                     }
-                    Either3::Second(Ok(None)) => {
+                    Either3::Second(Either::First(Ok(None))) => {
                         // Minimq made internal progress, such as keepalive traffic.
                     }
-                    Either3::Second(Err(error)) => {
+                    Either3::Second(Either::First(Err(error))) => {
                         log::error!(
                             "MQTT session service failed while waiting for next sample: {:?}",
                             error
                         );
                         break 'publishing;
+                    }
+                    Either3::Second(Either::Second(())) => {
+                        if led.status() == LedStatus::Fault {
+                            tick_fault_led(control, led).await;
+                        }
                     }
                     Either3::Third(()) => {
                         log::info!("UTC refresh deadline reached");
@@ -828,6 +1002,9 @@ async fn run_connected_session(
             .await
             {
                 log::info!("scheduled UTC clock refresh succeeded");
+                show_led_status(control, led, LedStatus::Idle).await;
+            } else {
+                show_led_status(control, led, LedStatus::Fault).await;
             }
         }
     }
@@ -839,7 +1016,7 @@ async fn run_supervisor(
     mqtt_rx_buffer: &mut [u8; MQTT_TCP_BUFFER_SIZE],
     mqtt_tx_buffer: &mut [u8; MQTT_TCP_BUFFER_SIZE],
 ) -> ! {
-    let Supervisor { app, control } = supervisor;
+    let Supervisor { app, control, led } = supervisor;
     let mut reconnect_backoff = RetryBackoff::new();
 
     // supervisor
@@ -847,11 +1024,12 @@ async fn run_supervisor(
         let mut network_recovered = false;
 
         if !app.stack.is_link_up() {
+            show_led_status(control, led, LedStatus::Fault).await;
             log::info!("network link is down; clearing stale Wi-Fi association state");
             control.leave().await;
 
             log::info!("returning to Wi-Fi join");
-            recover_wifi_with_sampling(app, control).await;
+            recover_wifi_with_sampling(app, control, led).await;
             network_recovered = true;
         }
 
@@ -859,22 +1037,27 @@ async fn run_supervisor(
             log::info!("network link is up; waiting for DHCP configuration");
 
             match select3(
-                app.stack.wait_config_up(),
-                app.stack.wait_link_down(),
+                select(app.stack.wait_config_up(), app.stack.wait_link_down()),
                 Timer::at(app.next_sample_at),
+                Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
             )
             .await
             {
-                Either3::First(()) => {
+                Either3::First(Either::First(())) => {
                     log::info!("network configuration restored");
                     network_recovered = true;
                 }
-                Either3::Second(()) => {
+                Either3::First(Either::Second(())) => {
                     log::info!("network link dropped while waiting for DHCP");
                     continue;
                 }
+                Either3::Second(()) => {
+                    capture_and_enqueue(app, control, led).await;
+                    show_led_status(control, led, LedStatus::Fault).await;
+                    continue;
+                }
                 Either3::Third(()) => {
-                    capture_and_enqueue(app).await;
+                    tick_fault_led(control, led).await;
                     continue;
                 }
             }
@@ -883,12 +1066,24 @@ async fn run_supervisor(
         if network_recovered {
             log::info!("network recovered; attempting UTC resynchronization");
 
-            if refresh_clock(&mut app.clock, app.stack, app.config.ntp_host, app.rng).await {
+            if await_with_fault_flash(
+                refresh_clock(&mut app.clock, app.stack, app.config.ntp_host, app.rng),
+                control,
+                led,
+            )
+            .await
+            {
                 log::info!("UTC clock anchor refreshed after network recovery");
             }
         }
 
-        let endpoint = match resolve_ipv4(app.stack, app.config.mqtt_host).await {
+        let endpoint = match await_with_fault_flash(
+            resolve_ipv4(app.stack, app.config.mqtt_host),
+            control,
+            led,
+        )
+        .await
+        {
             Ok(address) => {
                 let endpoint = embassy_net::IpEndpoint::new(address, app.config.mqtt_port);
 
@@ -902,6 +1097,7 @@ async fn run_supervisor(
             }
             Err(error) => {
                 error.log(app.config.mqtt_host);
+                show_led_status(control, led, LedStatus::Fault).await;
 
                 let retry_delay_secs = reconnect_backoff.next_delay_secs();
 
@@ -910,7 +1106,7 @@ async fn run_supervisor(
                     retry_delay_secs
                 );
 
-                wait_with_sampling(app, Duration::from_secs(retry_delay_secs)).await;
+                wait_with_sampling(app, control, led, Duration::from_secs(retry_delay_secs)).await;
                 continue;
             }
         };
@@ -922,9 +1118,13 @@ async fn run_supervisor(
 
         log::info!("connecting to MQTT endpoint {:?}", endpoint);
 
-        match with_timeout(
-            Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
-            mqtt_socket.connect(endpoint),
+        match await_with_fault_flash(
+            with_timeout(
+                Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
+                mqtt_socket.connect(endpoint),
+            ),
+            control,
+            led,
         )
         .await
         {
@@ -937,9 +1137,13 @@ async fn run_supervisor(
 
                 mqtt_socket.set_timeout(None);
 
-                match with_timeout(
-                    Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
-                    mqtt_session.connect(mqtt_socket),
+                match await_with_fault_flash(
+                    with_timeout(
+                        Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
+                        mqtt_session.connect(mqtt_socket),
+                    ),
+                    control,
+                    led,
                 )
                 .await
                 {
@@ -948,7 +1152,7 @@ async fn run_supervisor(
 
                         reconnect_backoff.reset();
 
-                        run_connected_session(app, &mut connection).await;
+                        run_connected_session(app, control, led, &mut connection).await;
                     }
                     Ok(Err(error)) => {
                         log::error!("MQTT session establishment failed: {:?}", error);
@@ -973,13 +1177,14 @@ async fn run_supervisor(
         };
 
         let retry_delay_secs = reconnect_backoff.next_delay_secs();
+        show_led_status(control, led, LedStatus::Fault).await;
 
         log::info!(
             "creating a fresh MQTT TCP socket in {} seconds",
             retry_delay_secs
         );
 
-        wait_with_sampling(app, Duration::from_secs(retry_delay_secs)).await;
+        wait_with_sampling(app, control, led, Duration::from_secs(retry_delay_secs)).await;
     }
 }
 
@@ -1077,10 +1282,14 @@ async fn main(spawner: Spawner) {
         .await;
 
     log::info!("radio ready: CYW43439 initialized in PowerSave mode");
+    let mut led = LedStatusModel::new();
+    // Startup is not yet a healthy idle state. Flash until the first sample
+    // attempt takes priority and a broker acknowledgment can establish Idle.
+    show_led_status(&mut control, &mut led, LedStatus::Fault).await;
 
     let started_at = Instant::now();
 
-    Timer::after_secs(2).await;
+    flash_fault_for(&mut control, &mut led, Duration::from_secs(2)).await;
 
     log::info!("Pico Data Logger v{} starting", env!("CARGO_PKG_VERSION"));
     log::info!(
@@ -1091,16 +1300,15 @@ async fn main(spawner: Spawner) {
         measurement_queue.capacity()
     );
 
-    check_sensor(&mut sht40, &mut delay).await;
+    if !await_with_fault_flash(check_sensor(&mut sht40, &mut delay), &mut control, &mut led).await {
+        show_led_status(&mut control, &mut led, LedStatus::Fault).await;
+    }
 
     let config = match AppConfig::load() {
         Ok(config) => config,
         Err(error) => {
             log::error!("invalid application configuration: {:?}", error);
-
-            loop {
-                Timer::after_secs(60).await;
-            }
+            flash_fault_forever(&mut control, &mut led).await;
         }
     };
     let mut hardware_id_buffer = [0_u8; 16];
@@ -1114,9 +1322,7 @@ async fn main(spawner: Spawner) {
         Ok(client_id) => client_id,
         Err(error) => {
             log::error!("failed to compose unique MQTT client ID: {:?}", error);
-            loop {
-                Timer::after_secs(60).await;
-            }
+            flash_fault_forever(&mut control, &mut led).await;
         }
     };
     log::info!(
@@ -1126,9 +1332,18 @@ async fn main(spawner: Spawner) {
         effective_client_id
     );
 
-    connect_wifi(&mut control, &stack, config.wifi_ssid, config.wifi_password).await;
+    connect_wifi(
+        &mut control,
+        &mut led,
+        &stack,
+        config.wifi_ssid,
+        config.wifi_password,
+    )
+    .await;
 
-    let clock_anchor = synchronize_clock_until_ready(stack, config.ntp_host, &mut rng).await;
+    let clock_anchor =
+        synchronize_clock_until_ready(stack, config.ntp_host, &mut rng, &mut control, &mut led)
+            .await;
     let clock = ClockState::new(clock_anchor);
 
     let mut mqtt_rx_buffer = [0_u8; MQTT_TCP_BUFFER_SIZE];
@@ -1147,10 +1362,7 @@ async fn main(spawner: Spawner) {
 
     let Some(mut mqtt_session) = mqtt_session else {
         log::error!("MQTT configuration unavailable; supervisor cannot start");
-
-        loop {
-            Timer::after_secs(PUBLISH_INTERVAL_SECS).await;
-        }
+        flash_fault_forever(&mut control, &mut led).await;
     };
 
     let mut supervisor = Supervisor {
@@ -1168,6 +1380,7 @@ async fn main(spawner: Spawner) {
             next_sample_at: Instant::now(),
         },
         control: &mut control,
+        led,
     };
 
     run_supervisor(
