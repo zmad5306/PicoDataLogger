@@ -406,7 +406,7 @@ These checks validate formatting, host-testable logic, linting, and compilation.
 
 ## Security limitations
 
-This is a LAN learning project, not a hardened production design:
+This firmware is intended for a trusted LAN and is not a hardened production design:
 
 - MQTT uses plaintext TCP. Network observers can read payloads and credentials, and the Pico does not authenticate the broker with TLS.
 - NTP is unauthenticated. A network attacker could spoof time and cause incorrect measurement timestamps.
@@ -415,17 +415,3 @@ This is a LAN learning project, not a hardened production design:
 - QoS 1 provides at-least-once transport, so consumers must tolerate duplicates.
 
 A production design should evaluate MQTT over TLS with broker certificate validation, protected credential provisioning/storage, authenticated time, and an explicit offline-delivery policy.
-
-## Learning recap
-
-- **Ownership and borrowing:** drivers, sockets, buffers, and protocol sessions have clear owners; borrowed buffers cannot be reused while an async operation still depends on them.
-- **Lifetimes:** the encoded JSON slice is tied to the caller-provided buffer, preventing it from outliving that storage.
-- **Traits:** the queue is generic over `embedded-storage` NOR-flash traits, so the same ordering and recovery logic runs against host fake flash and the Pico driver.
-- **`Result` and `Option`:** expected configuration, conversion, encoding, sensor, DNS, and protocol failures are handled explicitly instead of panicking.
-- **Async tasks:** the Embassy executor allows USB logging, the radio, networking, timers, and application work to make progress cooperatively without OS threads.
-- **Static memory:** fixed-size sensor, JSON, TCP, and MQTT buffers make memory use predictable and avoid garbage collection or an allocator.
-- **I2C:** the RP2350 communicates with the SHT40 over the GP0/GP1 I2C bus and validates sensor responses.
-- **UDP and NTP:** a validated NTP response anchors Unix time to a monotonic `Instant`; later timestamps advance from that known point.
-- **TCP:** TCP supplies MQTT's ordered byte transport but does not understand MQTT topics, publications, sessions, or keepalive.
-- **JSON:** a typed `Reading` is serialized into a reusable caller-owned buffer, with an explicit error when that buffer is too small.
-- **MQTT:** the client maintains a protocol session over TCP, services keepalive traffic between samples, publishes queued readings with QoS 1, and retires flash records only after PUBACK.
