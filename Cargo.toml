@@ -22,6 +22,7 @@ log = "0.4"
 static_cell = "2"
 panic-halt = "1.0"
 sht4x = { version = "0.2", features = ["embedded-hal-async"] }
+minimq = { version = "0.13", default-features = false }
 
 [target.'cfg(target_os = "none")'.dependencies.embassy-rp]
 version = "0.10"
