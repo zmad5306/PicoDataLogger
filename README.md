@@ -80,7 +80,7 @@ The remaining settings are optional:
 ```powershell
 $env:MQTT_PORT = "1883"
 $env:MQTT_TOPIC = "pico-data-logger/readings"
-$env:MQTT_CLIENT_ID = "pico-data-logger"
+$env:MQTT_CLIENT_ID = "home-office"
 $env:MQTT_USERNAME = "your-mqtt-username"
 $env:MQTT_PASSWORD = "your-mqtt-password"
 $env:NTP_HOST = "pool.ntp.org"
@@ -95,7 +95,7 @@ export MQTT_HOST="broker.example.com"
 
 export MQTT_PORT="1883"
 export MQTT_TOPIC="pico-data-logger/readings"
-export MQTT_CLIENT_ID="pico-data-logger"
+export MQTT_CLIENT_ID="home-office"
 export MQTT_USERNAME="your-mqtt-username"
 export MQTT_PASSWORD="your-mqtt-password"
 export NTP_HOST="pool.ntp.org"
@@ -111,7 +111,7 @@ unset MQTT_USERNAME MQTT_PASSWORD
 
 `NTP_HOST` uses its documented default when omitted.
 
-These values are read by `option_env!` during compilation. They are embedded in the resulting firmware binary, so compile-time configuration prevents accidental source-control commits but does not make credentials secret from someone who obtains the binary. Do not commit real credentials or generated firmware containing them.
+These values are read by `option_env!` during compilation. `MQTT_CLIENT_ID` is the human-readable logical device name and defaults to `pico-data-logger`; the firmware appends `-<hardware_id>` to form the unique broker connection ID. They are embedded in the resulting firmware binary, so compile-time configuration prevents accidental source-control commits but does not make credentials secret from someone who obtains the binary. Do not commit real credentials or generated firmware containing them.
 
 ### Automated build and flash
 
@@ -250,9 +250,11 @@ The data path is:
 ```text
 SHT40 over I2C
   -> fixed-point measurement conversion
-  -> reading with synchronized UTC and uptime
+  -> reading with logical/hardware identity, sequence, synchronized UTC, and uptime
+  -> append-only onboard-flash queue
   -> JSON encoded into a reusable fixed-size buffer
-  -> MQTT QoS 0 publication over TCP/Wi-Fi
+  -> MQTT QoS 1 publication over TCP/Wi-Fi
+  -> local retirement after broker PUBACK
   -> broker subscriber
 ```
 
@@ -267,7 +269,8 @@ At boot the firmware:
 3. Joins the configured Wi-Fi network and waits for DHCP.
 4. Resolves the NTP host and waits until it obtains a valid UTC clock anchor.
 5. Resolves the MQTT broker, opens TCP, and establishes the MQTT session.
-6. Measures and publishes once every 60 seconds while servicing MQTT traffic between samples.
+6. Recovers the flash-backed measurement queue, then measures once every 60 seconds whether or not MQTT is available.
+7. Publishes queued measurements oldest-first with MQTT QoS 1, removing each record only after its PUBACK arrives.
 
 Each reading is timestamped when the measurement is captured, before JSON encoding and network delivery. The firmware publishes both absolute UTC and uptime because they answer different questions: UTC identifies when the measurement occurred, while uptime helps identify reboots and how long the current run has lasted.
 
@@ -301,17 +304,26 @@ docker exec -it <mosquitto-container> \
 Use the configured host, port, topic, and authentication flags when they differ from the defaults. A reading has this shape:
 
 ```json
-{"temperature_c":21.34,"relative_humidity_pct":43.13,"timestamp_unix_s":1789916205,"uptime_s":16}
+{"device_id":"basement-sensor","hardware_id":"0123456789abcdef","sequence":42,"temperature_c":21.34,"relative_humidity_pct":43.13,"timestamp_unix_s":1789916205,"uptime_s":16}
 ```
 
 | Field | Meaning |
 | --- | --- |
+| `device_id` | Human-readable logical identity from `MQTT_CLIENT_ID`, such as `home-office`. |
+| `hardware_id` | Stable 16-digit hexadecimal RP2350 chip ID read from OTP memory. It is an identifier, not a secret. |
+| `sequence` | Monotonically increasing record identifier; repeated values identify at-least-once replay after a reset. |
 | `temperature_c` | SHT40 temperature in degrees Celsius. |
 | `relative_humidity_pct` | SHT40 relative humidity percentage. |
 | `timestamp_unix_s` | UTC Unix timestamp captured with the measurement. |
 | `uptime_s` | Whole seconds since this firmware booted. |
 
-Publications use MQTT QoS 0 and are not retained. Submission means the client handed the publication to the MQTT connection; it does not guarantee that a subscriber consumed it, and an offline subscriber does not receive a queued copy later.
+The MQTT connection client ID combines both identities as `<device_id>-<hardware_id>`, preventing two physical Picos with the same human-readable configuration from disconnecting each other. Publications use MQTT QoS 1 and are not retained. The firmware keeps each flash record until the broker acknowledges its publication. If power fails after broker delivery but before local retirement, that record is sent again after reboot; consumers should use `(hardware_id, sequence)` to recognize the duplicate. `device_id` remains convenient for human-facing grouping and can intentionally survive hardware replacement.
+
+### Offline queue capacity and wear
+
+The final 256 KiB of onboard flash is reserved for measurements and excluded from the firmware link region. Records occupy one 256-byte flash page and include a format version, sequence number, original Unix timestamp, temperature, humidity, uptime, and CRC-32 integrity check. One 4-KiB erase sector is retained as circular working space, leaving 1,008 usable records—16 hours and 48 minutes at one reading per minute.
+
+Writes are append-only. A record becomes visible only after its body and checksum have been written and a final commit byte is programmed. Recovery ignores incomplete or corrupt records and reconstructs FIFO order from sequence numbers. Acknowledgment and commit markers only clear flash bits; sectors are erased in 16-record batches instead of once per measurement. When all 1,008 positions are occupied, the oldest measurement is explicitly discarded so newer outage data continues to be captured.
 
 ## Recovery behavior
 
@@ -320,7 +332,7 @@ The application is supervised indefinitely rather than stopping after a fixed nu
 Recovery discards state from the failed layer upward:
 
 - A failed SHT40 read skips one publication and retries at the next 60-second sample without dropping a healthy MQTT session.
-- A broker DNS, TCP, MQTT handshake, publish, keepalive, or disconnect failure drops the MQTT connection and TCP socket. The next attempt resolves the broker again and creates fresh transport state.
+- A broker DNS, TCP, MQTT handshake, publish, keepalive, or disconnect failure drops the MQTT connection and TCP socket while the 60-second sampler continues appending timestamped readings to flash. The next attempt resolves the broker again, creates fresh transport state, and replays the backlog before newly captured readings.
 - A lost Wi-Fi link explicitly clears stale CYW43439 association state, then returns to Wi-Fi join and DHCP before DNS, NTP, TCP, and MQTT are rebuilt.
 - A UTC refresh failure retains the last valid clock anchor and retries with the same bounded-backoff policy. A successful refresh resets that backoff and schedules the next daily refresh.
 
@@ -339,9 +351,11 @@ Keep the USB serial monitor and MQTT subscriber visible during each check. Do no
 
 ### Broker outage
 
-1. Stop the broker for longer than the former three-attempt window and observe continued bounded retries.
-2. Start the broker again.
-3. Confirm a fresh TCP/MQTT connection is established and publications resume without resetting the Pico.
+1. Subscribe to the readings topic and note the latest `sequence` and `timestamp_unix_s`.
+2. Block broker access for at least three 60-second sample intervals and confirm serial queue depth grows.
+3. Power-cycle the Pico while broker access remains blocked; confirm recovery logs the preserved queue depth.
+4. Restore broker access and observe the queued timestamps arrive in ascending sequence order before normal live publishing resumes.
+5. Confirm any duplicate carries the same sequence number and that recovery requires no manual reset.
 
 If the broker repeatedly reports a timeout, confirm the firmware services the MQTT connection between samples and that its keepalive is not being blocked by a firewall or container networking rule.
 
@@ -364,7 +378,7 @@ If the broker repeatedly reports a timeout, confirm the firmware services the MQ
 - **DNS resolution fails:** verify DHCP supplied reachable DNS servers and that `MQTT_HOST` and `NTP_HOST` are valid from the Pico's network.
 - **TCP is reset or times out:** verify the broker is running, listening on `MQTT_PORT`, published through its Docker/network configuration, and allowed by host and network firewalls.
 - **MQTT handshake fails:** verify the protocol listener, client ID policy, and the username/password pair. A second connection using the same client ID can cause a broker to disconnect the older client.
-- **No subscriber output:** verify the subscriber uses the configured topic and authentication. QoS 0 messages published while the subscriber is offline are not replayed.
+- **No subscriber output:** verify the subscriber uses the configured topic and authentication. Broker access must recover before the device can replay its flash backlog.
 - **Timestamps are implausible:** inspect the NTP validation and clock-anchor logs. Uptime is diagnostic metadata and must not be interpreted as Unix time.
 
 ## Automated checks
@@ -385,7 +399,8 @@ This is a LAN learning project, not a hardened production design:
 - MQTT uses plaintext TCP. Network observers can read payloads and credentials, and the Pico does not authenticate the broker with TLS.
 - NTP is unauthenticated. A network attacker could spoof time and cause incorrect measurement timestamps.
 - Wi-Fi and optional MQTT credentials are compiled into the firmware. Ignoring `.env` prevents an ordinary source-control leak but does not protect secrets extracted from the firmware binary or physical device.
-- QoS 0 prioritizes simplicity and low overhead over guaranteed delivery.
+- The public RP2350 hardware ID enables stable device correlation and must not be treated as authentication material.
+- QoS 1 provides at-least-once transport, so consumers must tolerate duplicates.
 
 A production design should evaluate MQTT over TLS with broker certificate validation, protected credential provisioning/storage, authenticated time, and an explicit offline-delivery policy.
 
@@ -393,7 +408,7 @@ A production design should evaluate MQTT over TLS with broker certificate valida
 
 - **Ownership and borrowing:** drivers, sockets, buffers, and protocol sessions have clear owners; borrowed buffers cannot be reused while an async operation still depends on them.
 - **Lifetimes:** the encoded JSON slice is tied to the caller-provided buffer, preventing it from outliving that storage.
-- **Traits:** Embassy and device crates connect generic drivers through embedded I/O traits rather than application code manipulating registers directly.
+- **Traits:** the queue is generic over `embedded-storage` NOR-flash traits, so the same ordering and recovery logic runs against host fake flash and the Pico driver.
 - **`Result` and `Option`:** expected configuration, conversion, encoding, sensor, DNS, and protocol failures are handled explicitly instead of panicking.
 - **Async tasks:** the Embassy executor allows USB logging, the radio, networking, timers, and application work to make progress cooperatively without OS threads.
 - **Static memory:** fixed-size sensor, JSON, TCP, and MQTT buffers make memory use predictable and avoid garbage collection or an allocator.
@@ -401,4 +416,4 @@ A production design should evaluate MQTT over TLS with broker certificate valida
 - **UDP and NTP:** a validated NTP response anchors Unix time to a monotonic `Instant`; later timestamps advance from that known point.
 - **TCP:** TCP supplies MQTT's ordered byte transport but does not understand MQTT topics, publications, sessions, or keepalive.
 - **JSON:** a typed `Reading` is serialized into a reusable caller-owned buffer, with an explicit error when that buffer is too small.
-- **MQTT:** the client maintains a protocol session over TCP, services keepalive traffic between samples, publishes QoS 0 readings, and recreates failed connection state under the supervisor.
+- **MQTT:** the client maintains a protocol session over TCP, services keepalive traffic between samples, publishes queued readings with QoS 1, and retires flash records only after PUBACK.

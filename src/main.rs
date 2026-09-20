@@ -8,21 +8,23 @@ use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::dma;
+use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::i2c::{
     Async as I2cAsync, Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler,
 };
-use embassy_rp::peripherals::{DMA_CH0, I2C0, PIO0, USB};
+use embassy_rp::peripherals::{DMA_CH0, FLASH, I2C0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
-use embassy_time::{Delay, Duration, Instant, Ticker, Timer, with_timeout};
+use embassy_time::{Delay, Duration, Instant, Timer, with_timeout};
 use panic_halt as _;
 use pico_data_logger::backoff::RetryBackoff;
+use pico_data_logger::flash_queue::{FlashQueue, MeasurementRecord};
 use pico_data_logger::ntp::{
     NTP_PACKET_LEN, build_ntp_request, ntp_to_unix_seconds, unix_seconds_from_anchor,
     validate_ntp_response,
 };
-use pico_data_logger::{Reading, encode_reading};
+use pico_data_logger::{Reading, compose_mqtt_client_id, encode_reading, format_hardware_id};
 use sht4x::{Precision, Sht4xAsync};
 use static_cell::StaticCell;
 
@@ -32,10 +34,14 @@ const MQTT_TCP_TIMEOUT_SECS: u64 = 10;
 const MQTT_PACKET_RX_BUFFER_SIZE: usize = 512;
 const MQTT_PACKET_TX_BUFFER_SIZE: usize = 1024;
 const MQTT_KEEPALIVE_SECS: u16 = 90;
-const READING_JSON_BUFFER_SIZE: usize = 128;
+const READING_JSON_BUFFER_SIZE: usize = 256;
 const PUBLISH_INTERVAL_SECS: u64 = 60;
 const UTC_REFRESH_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const WIFI_JOIN_TIMEOUT_SECS: u64 = 15;
+const MQTT_EFFECTIVE_CLIENT_ID_SIZE: usize = 96;
+const FLASH_SIZE: usize = 4 * 1024 * 1024;
+const STORAGE_OFFSET: u32 = 0x003c_0000;
+const STORAGE_LENGTH: u32 = 256 * 1024;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -46,6 +52,7 @@ bind_interrupts!(struct Irqs {
 
 type UsbDriver = Driver<'static, USB>;
 type Sensor = Sht4xAsync<I2c<'static, I2C0, I2cAsync>, Delay>;
+type MeasurementQueue = FlashQueue<Flash<'static, FLASH, Blocking, FLASH_SIZE>>;
 
 struct AppConfig {
     wifi_ssid: &'static str,
@@ -79,6 +86,9 @@ struct AppRuntime<'a> {
     started_at: Instant,
     clock: ClockState,
     reading_json_buffer: &'a mut [u8; READING_JSON_BUFFER_SIZE],
+    hardware_id: &'a str,
+    queue: &'a mut MeasurementQueue,
+    next_sample_at: Instant,
 }
 
 struct Supervisor<'a> {
@@ -497,12 +507,15 @@ async fn refresh_clock(
     }
 }
 
-async fn capture_reading(
+async fn capture_reading<'a>(
     sensor: &mut Sensor,
     delay: &mut Delay,
     clock: &ClockAnchor,
     started_at: Instant,
-) -> Option<Reading> {
+    sequence: u64,
+    device_id: &'a str,
+    hardware_id: &'a str,
+) -> Option<Reading<'a>> {
     let measurement = match sensor.measure(Precision::High, delay).await {
         Ok(measurement) => measurement,
         Err(sht4x::Error::I2c(error)) => {
@@ -539,6 +552,9 @@ async fn capture_reading(
     };
 
     let reading = Reading {
+        device_id,
+        hardware_id,
+        sequence,
         temperature_c,
         relative_humidity_pct,
         timestamp_unix_s,
@@ -556,13 +572,182 @@ async fn capture_reading(
     Some(reading)
 }
 
+async fn capture_and_enqueue(runtime: &mut AppRuntime<'_>) {
+    let sequence = runtime.queue.next_sequence();
+    let reading = capture_reading(
+        runtime.sensor,
+        runtime.delay,
+        &runtime.clock.anchor,
+        runtime.started_at,
+        sequence,
+        runtime.config.mqtt_client_id,
+        runtime.hardware_id,
+    )
+    .await;
+    runtime.next_sample_at += Duration::from_secs(PUBLISH_INTERVAL_SECS);
+
+    let Some(reading) = reading else { return };
+    let previous_dropped = runtime.queue.dropped();
+    match runtime.queue.append(
+        reading.timestamp_unix_s,
+        reading.temperature_c,
+        reading.relative_humidity_pct,
+        reading.uptime_s,
+    ) {
+        Ok(record) => {
+            if runtime.queue.dropped() != previous_dropped {
+                log::error!("measurement queue full; discarded oldest record");
+            }
+            log::info!(
+                "queued measurement: sequence={} depth={}/{}",
+                record.sequence,
+                runtime.queue.depth(),
+                runtime.queue.capacity()
+            );
+        }
+        Err(error) => log::error!("failed to persist measurement: {:?}", error),
+    }
+}
+
+fn queued_reading<'a>(
+    record: MeasurementRecord,
+    device_id: &'a str,
+    hardware_id: &'a str,
+) -> Reading<'a> {
+    Reading {
+        device_id,
+        hardware_id,
+        sequence: record.sequence,
+        temperature_c: record.temperature_c,
+        relative_humidity_pct: record.relative_humidity_pct,
+        timestamp_unix_s: record.timestamp_unix_s,
+        uptime_s: record.uptime_s,
+    }
+}
+
+async fn drain_queue(
+    runtime: &mut AppRuntime<'_>,
+    connection: &mut minimq::Connection<'_, '_, embassy_net::tcp::TcpSocket<'_>>,
+) -> bool {
+    loop {
+        while runtime.next_sample_at <= Instant::now() {
+            capture_and_enqueue(runtime).await;
+        }
+        let record = match runtime.queue.peek_oldest() {
+            Ok(Some(record)) => record,
+            Ok(None) => return true,
+            Err(error) => {
+                log::error!("failed to read measurement queue: {:?}", error);
+                return false;
+            }
+        };
+        let reading = queued_reading(record, runtime.config.mqtt_client_id, runtime.hardware_id);
+        let payload = match encode_reading(&reading, runtime.reading_json_buffer) {
+            Ok(payload) => payload,
+            Err(error) => {
+                log::error!("failed to encode queued measurement: {:?}", error);
+                return false;
+            }
+        };
+        let publication = minimq::Publication::bytes(runtime.config.mqtt_topic, payload)
+            .qos(minimq::QoS::AtLeastOnce);
+        let operation = match connection.publish(publication).await {
+            Ok(Some(operation)) => operation,
+            Ok(None) => {
+                log::error!("QoS 1 publish returned no operation handle");
+                return false;
+            }
+            Err(error) => {
+                log::error!("queued MQTT publish failed: {:?}", error);
+                return false;
+            }
+        };
+        while connection.is_pending(&operation) {
+            match select(connection.poll(), Timer::at(runtime.next_sample_at)).await {
+                Either::First(Ok(_)) => {}
+                Either::First(Err(error)) => {
+                    log::error!("MQTT failed while awaiting PUBACK: {:?}", error);
+                    return false;
+                }
+                Either::Second(()) => capture_and_enqueue(runtime).await,
+            }
+        }
+        if !connection.is_complete(&operation) {
+            log::error!("queued MQTT publish was not acknowledged");
+            return false;
+        }
+        match runtime.queue.acknowledge_oldest() {
+            Ok(_) => log::info!(
+                "replayed queued measurement: sequence={} remaining={}",
+                record.sequence,
+                runtime.queue.depth()
+            ),
+            Err(error) => {
+                log::error!("PUBACK received but queue retirement failed: {:?}", error);
+                return false;
+            }
+        }
+    }
+}
+
+async fn wait_with_sampling(runtime: &mut AppRuntime<'_>, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    loop {
+        match select(Timer::at(deadline), Timer::at(runtime.next_sample_at)).await {
+            Either::First(()) => return,
+            Either::Second(()) => capture_and_enqueue(runtime).await,
+        }
+    }
+}
+
+async fn recover_wifi_with_sampling(app: &mut AppRuntime<'_>, control: &mut cyw43::Control<'_>) {
+    loop {
+        let mut join_options = cyw43::JoinOptions::new(app.config.wifi_password.as_bytes());
+        join_options.auth = cyw43::JoinAuth::Wpa2;
+        match select3(
+            Timer::after_secs(WIFI_JOIN_TIMEOUT_SECS),
+            control.join(app.config.wifi_ssid, join_options),
+            Timer::at(app.next_sample_at),
+        )
+        .await
+        {
+            Either3::First(()) => {
+                log::error!("Wi-Fi recovery join timed out");
+                control.leave().await;
+            }
+            Either3::Second(Ok(())) => break,
+            Either3::Second(Err(error)) => log::error!("Wi-Fi recovery join failed: {:?}", error),
+            Either3::Third(()) => {
+                capture_and_enqueue(app).await;
+                continue;
+            }
+        }
+        wait_with_sampling(app, Duration::from_secs(5)).await;
+    }
+
+    while !app.stack.is_link_up() {
+        match select(app.stack.wait_link_up(), Timer::at(app.next_sample_at)).await {
+            Either::First(()) => {}
+            Either::Second(()) => capture_and_enqueue(app).await,
+        }
+    }
+    while !app.stack.is_config_up() {
+        match select(app.stack.wait_config_up(), Timer::at(app.next_sample_at)).await {
+            Either::First(()) => {}
+            Either::Second(()) => capture_and_enqueue(app).await,
+        }
+    }
+    log::info!("Wi-Fi and DHCP recovered");
+}
+
 fn create_mqtt_session<'buffer>(
     config: &AppConfig,
+    effective_client_id: &str,
     packet_rx_buffer: &'buffer mut [u8; MQTT_PACKET_RX_BUFFER_SIZE],
     packet_tx_buffer: &'buffer mut [u8; MQTT_PACKET_TX_BUFFER_SIZE],
 ) -> Option<minimq::Session<'buffer>> {
     let buffers = minimq::Buffers::new(packet_rx_buffer, packet_tx_buffer);
-    let builder = match minimq::ConfigBuilder::new(buffers).client_id(config.mqtt_client_id) {
+    let builder = match minimq::ConfigBuilder::new(buffers).client_id(effective_client_id) {
         Ok(builder) => builder.keepalive_interval(MQTT_KEEPALIVE_SECS),
         Err(error) => {
             log::error!("invalid MQTT client configuration: {:?}", error);
@@ -592,68 +777,22 @@ async fn run_connected_session(
     runtime: &mut AppRuntime<'_>,
     connection: &mut minimq::Connection<'_, '_, embassy_net::tcp::TcpSocket<'_>>,
 ) {
-    let mut publish_ticker = Ticker::every(Duration::from_secs(PUBLISH_INTERVAL_SECS));
-
     'publishing: loop {
-        let live_reading = capture_reading(
-            runtime.sensor,
-            runtime.delay,
-            &runtime.clock.anchor,
-            runtime.started_at,
-        )
-        .await;
-
-        let mqtt_payload = match live_reading.as_ref() {
-            Some(reading) => match encode_reading(reading, runtime.reading_json_buffer) {
-                Ok(payload) => {
-                    log::info!("encoded live MQTT payload: {} bytes", payload.len());
-                    Some(payload)
-                }
-                Err(error) => {
-                    log::error!("failed to encode live MQTT payload: {:?}", error);
-                    None
-                }
-            },
-            None => {
-                log::error!("MQTT publish skipped: no valid live reading");
-                None
-            }
-        };
-
-        if let Some(payload) = mqtt_payload {
-            let publication = minimq::Publication::bytes(runtime.config.mqtt_topic, payload);
-
-            match connection.publish(publication).await {
-                Ok(None) => {
-                    log::info!(
-                        "MQTT QoS 0 sensor reading submitted: topic={}",
-                        runtime.config.mqtt_topic
-                    );
-                }
-                Ok(Some(_)) => {
-                    log::error!("MQTT QoS 0 publish unexpectedly returned an operation handle");
-                }
-                Err(error) => {
-                    log::error!("MQTT sensor reading publish failed: {:?}", error);
-                }
-            }
-        }
-
-        if !connection.is_connected() {
-            log::error!("MQTT publishing loop stopped; connection will be retried");
-            break;
+        if !drain_queue(runtime, connection).await {
+            break 'publishing;
         }
 
         loop {
             let utc_refresh_due = loop {
                 match select3(
-                    publish_ticker.next(),
+                    Timer::at(runtime.next_sample_at),
                     connection.poll(),
                     Timer::at(runtime.clock.next_refresh_at),
                 )
                 .await
                 {
                     Either3::First(()) => {
+                        capture_and_enqueue(runtime).await;
                         break false;
                     }
                     Either3::Second(Ok(Some(_publication))) => {
@@ -712,26 +851,30 @@ async fn run_supervisor(
             control.leave().await;
 
             log::info!("returning to Wi-Fi join");
-            connect_wifi(
-                control,
-                &app.stack,
-                app.config.wifi_ssid,
-                app.config.wifi_password,
-            )
-            .await;
+            recover_wifi_with_sampling(app, control).await;
             network_recovered = true;
         }
 
         if !app.stack.is_config_up() {
             log::info!("network link is up; waiting for DHCP configuration");
 
-            match select(app.stack.wait_config_up(), app.stack.wait_link_down()).await {
-                Either::First(()) => {
+            match select3(
+                app.stack.wait_config_up(),
+                app.stack.wait_link_down(),
+                Timer::at(app.next_sample_at),
+            )
+            .await
+            {
+                Either3::First(()) => {
                     log::info!("network configuration restored");
                     network_recovered = true;
                 }
-                Either::Second(()) => {
+                Either3::Second(()) => {
                     log::info!("network link dropped while waiting for DHCP");
+                    continue;
+                }
+                Either3::Third(()) => {
+                    capture_and_enqueue(app).await;
                     continue;
                 }
             }
@@ -767,7 +910,7 @@ async fn run_supervisor(
                     retry_delay_secs
                 );
 
-                Timer::after_secs(retry_delay_secs).await;
+                wait_with_sampling(app, Duration::from_secs(retry_delay_secs)).await;
                 continue;
             }
         };
@@ -836,7 +979,7 @@ async fn run_supervisor(
             retry_delay_secs
         );
 
-        Timer::after_secs(retry_delay_secs).await;
+        wait_with_sampling(app, Duration::from_secs(retry_delay_secs)).await;
     }
 }
 
@@ -849,6 +992,28 @@ async fn main(spawner: Spawner) {
     let driver = Driver::new(p.USB, Irqs);
 
     spawner.spawn(logger_task(driver).expect("Failed to start logger task"));
+
+    let hardware_chip_id = match embassy_rp::otp::get_chipid() {
+        Ok(chip_id) => chip_id,
+        Err(error) => {
+            log::error!("failed to read RP2350 hardware ID: {:?}", error);
+            loop {
+                Timer::after_secs(60).await;
+            }
+        }
+    };
+
+    let flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
+    let (mut measurement_queue, recovery) =
+        match FlashQueue::recover(flash, STORAGE_OFFSET, STORAGE_LENGTH) {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("measurement queue recovery failed: {:?}", error);
+                loop {
+                    Timer::after_secs(60).await;
+                }
+            }
+        };
 
     let mut i2c_config = I2cConfig::default();
     i2c_config.frequency = 100_000; // 100 kHz
@@ -918,6 +1083,13 @@ async fn main(spawner: Spawner) {
     Timer::after_secs(2).await;
 
     log::info!("Pico Data Logger v{} starting", env!("CARGO_PKG_VERSION"));
+    log::info!(
+        "measurement queue recovered: depth={} corrupt={} next_sequence={} capacity={}",
+        recovery.depth,
+        recovery.corrupt_records,
+        recovery.next_sequence,
+        measurement_queue.capacity()
+    );
 
     check_sensor(&mut sht40, &mut delay).await;
 
@@ -931,6 +1103,28 @@ async fn main(spawner: Spawner) {
             }
         }
     };
+    let mut hardware_id_buffer = [0_u8; 16];
+    let hardware_id = format_hardware_id(hardware_chip_id, &mut hardware_id_buffer);
+    let mut effective_client_id_buffer = [0_u8; MQTT_EFFECTIVE_CLIENT_ID_SIZE];
+    let effective_client_id = match compose_mqtt_client_id(
+        config.mqtt_client_id,
+        hardware_id,
+        &mut effective_client_id_buffer,
+    ) {
+        Ok(client_id) => client_id,
+        Err(error) => {
+            log::error!("failed to compose unique MQTT client ID: {:?}", error);
+            loop {
+                Timer::after_secs(60).await;
+            }
+        }
+    };
+    log::info!(
+        "device identity ready: device_id={} hardware_id={} mqtt_client_id={}",
+        config.mqtt_client_id,
+        hardware_id,
+        effective_client_id
+    );
 
     connect_wifi(&mut control, &stack, config.wifi_ssid, config.wifi_password).await;
 
@@ -946,6 +1140,7 @@ async fn main(spawner: Spawner) {
 
     let mqtt_session = create_mqtt_session(
         &config,
+        effective_client_id,
         &mut mqtt_packet_rx_buffer,
         &mut mqtt_packet_tx_buffer,
     );
@@ -968,6 +1163,9 @@ async fn main(spawner: Spawner) {
             started_at,
             clock,
             reading_json_buffer: &mut reading_json_buffer,
+            hardware_id,
+            queue: &mut measurement_queue,
+            next_sample_at: Instant::now(),
         },
         control: &mut control,
     };
