@@ -166,7 +166,7 @@ Recovery follows the failed layer:
 
 - A sensor error skips one sample but preserves a healthy MQTT connection.
 - DNS, TCP, MQTT handshake, publish, keepalive, or disconnect failures discard the MQTT connection and TCP socket. Publish submission and PUBACK waits are bounded to 15 seconds, and a connected TCP socket is bounded by a 120-second receive-inactivity timeout. Timed-out QoS 1 records remain in flash for replay. The next attempt re-resolves DNS and creates fresh transport state.
-- Link loss clears stale CYW43439 association state, rejoins Wi-Fi with a bounded attempt, waits for DHCP, and then rebuilds time and broker state.
+- Link loss clears stale CYW43439 association state, rejoins Wi-Fi with a bounded attempt, waits for DHCP, and then rebuilds time and broker state. Startup also bounds DHCP acquisition to 30 seconds and rejoins Wi-Fi after a timeout.
 - MQTT reconnection and UTC refresh delays grow through 1, 2, 4, 8, 16, 32, and 60 seconds, then remain capped. Successful recovery resets the applicable backoff.
 
 Only invalid compile-time application configuration reaches the deliberate parked diagnostic state. Runtime network and service failures continue retrying.

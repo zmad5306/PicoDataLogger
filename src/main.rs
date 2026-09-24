@@ -32,6 +32,7 @@ use sht4x::{Precision, Sht4xAsync};
 use static_cell::StaticCell;
 
 const NTP_PORT: u16 = 123;
+const DHCP_TIMEOUT_SECS: u64 = 30;
 const MQTT_TCP_BUFFER_SIZE: usize = 1024;
 const MQTT_TCP_TIMEOUT_SECS: u64 = 10;
 const MQTT_CONNECTED_TCP_TIMEOUT_SECS: u64 = 120;
@@ -294,7 +295,7 @@ async fn connect_wifi(
             WIFI_JOIN_TIMEOUT_SECS
         );
 
-        match select(
+        let joined = match select(
             Timer::after_secs(WIFI_JOIN_TIMEOUT_SECS),
             control.join_with_gpio_flash(
                 ssid,
@@ -313,14 +314,53 @@ async fn connect_wifi(
                 );
                 control.leave().await;
                 show_led_status(control, led, LedStatus::Fault).await;
+                false
             }
             Either::Second(Ok(())) => {
                 log::info!("joined configured Wi-Fi network");
                 show_led_status(control, led, LedStatus::Fault).await;
-                break;
+                true
             }
             Either::Second(Err(error)) => {
                 log::error!("Wi-Fi join failed: {:?}", error);
+                show_led_status(control, led, LedStatus::Fault).await;
+                false
+            }
+        };
+
+        if !joined {
+            log::info!("retrying Wi-Fi join in 5 seconds");
+            flash_fault_for(control, led, Duration::from_secs(5)).await;
+            continue;
+        }
+
+        if !stack.is_link_up() {
+            log::info!("waiting for network link");
+            await_with_fault_flash(stack.wait_link_up(), control, led).await;
+        }
+
+        log::info!(
+            "network link up; waiting up to {} seconds for DHCP",
+            DHCP_TIMEOUT_SECS
+        );
+
+        match await_with_fault_flash(
+            with_timeout(
+                Duration::from_secs(DHCP_TIMEOUT_SECS),
+                stack.wait_config_up(),
+            ),
+            control,
+            led,
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(_) => {
+                log::error!(
+                    "DHCP timed out after {} seconds; leaving Wi-Fi before retry",
+                    DHCP_TIMEOUT_SECS
+                );
+                control.leave().await;
                 show_led_status(control, led, LedStatus::Fault).await;
             }
         }
@@ -328,12 +368,6 @@ async fn connect_wifi(
         log::info!("retrying Wi-Fi join in 5 seconds");
         flash_fault_for(control, led, Duration::from_secs(5)).await;
     }
-
-    log::info!("waiting for network link");
-    await_with_fault_flash(stack.wait_link_up(), control, led).await;
-    log::info!("network link up; waiting for DHCP");
-
-    await_with_fault_flash(stack.wait_config_up(), control, led).await;
 
     match stack.config_v4() {
         Some(ipv4_config) => {

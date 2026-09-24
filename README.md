@@ -333,7 +333,7 @@ Recovery discards state from the failed layer upward:
 
 - A failed SHT40 read skips one publication and retries at the next 60-second sample without dropping a healthy MQTT session.
 - A broker DNS, TCP, MQTT handshake, publish, keepalive, or disconnect failure drops the MQTT connection and TCP socket while the 60-second sampler continues appending timestamped readings to flash. MQTT publish submission and PUBACK waits each have a 15-second deadline, and connected sockets have a 120-second receive-inactivity timeout. The next attempt resolves the broker again, creates fresh transport state, and replays the backlog before newly captured readings.
-- A lost Wi-Fi link explicitly clears stale CYW43439 association state, then returns to Wi-Fi join and DHCP before DNS, NTP, TCP, and MQTT are rebuilt.
+- A lost Wi-Fi link explicitly clears stale CYW43439 association state, then returns to Wi-Fi join and DHCP before DNS, NTP, TCP, and MQTT are rebuilt. Startup DHCP waits are bounded to 30 seconds; a timeout leaves the association and retries from Wi-Fi join instead of hanging indefinitely.
 - A UTC refresh failure retains the last valid clock anchor and retries with the same bounded-backoff policy. A successful refresh resets that backoff and schedules the next daily refresh.
 
 The USB logger remains a separate task throughout these paths, so the serial log should continue reporting recovery transitions while the application waits.
