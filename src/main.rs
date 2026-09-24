@@ -32,8 +32,11 @@ use sht4x::{Precision, Sht4xAsync};
 use static_cell::StaticCell;
 
 const NTP_PORT: u16 = 123;
+const DHCP_TIMEOUT_SECS: u64 = 30;
 const MQTT_TCP_BUFFER_SIZE: usize = 1024;
 const MQTT_TCP_TIMEOUT_SECS: u64 = 10;
+const MQTT_CONNECTED_TCP_TIMEOUT_SECS: u64 = 120;
+const MQTT_PUBLISH_TIMEOUT_SECS: u64 = 15;
 const MQTT_PACKET_RX_BUFFER_SIZE: usize = 512;
 const MQTT_PACKET_TX_BUFFER_SIZE: usize = 1024;
 const MQTT_KEEPALIVE_SECS: u16 = 90;
@@ -292,7 +295,7 @@ async fn connect_wifi(
             WIFI_JOIN_TIMEOUT_SECS
         );
 
-        match select(
+        let joined = match select(
             Timer::after_secs(WIFI_JOIN_TIMEOUT_SECS),
             control.join_with_gpio_flash(
                 ssid,
@@ -311,14 +314,53 @@ async fn connect_wifi(
                 );
                 control.leave().await;
                 show_led_status(control, led, LedStatus::Fault).await;
+                false
             }
             Either::Second(Ok(())) => {
                 log::info!("joined configured Wi-Fi network");
                 show_led_status(control, led, LedStatus::Fault).await;
-                break;
+                true
             }
             Either::Second(Err(error)) => {
                 log::error!("Wi-Fi join failed: {:?}", error);
+                show_led_status(control, led, LedStatus::Fault).await;
+                false
+            }
+        };
+
+        if !joined {
+            log::info!("retrying Wi-Fi join in 5 seconds");
+            flash_fault_for(control, led, Duration::from_secs(5)).await;
+            continue;
+        }
+
+        if !stack.is_link_up() {
+            log::info!("waiting for network link");
+            await_with_fault_flash(stack.wait_link_up(), control, led).await;
+        }
+
+        log::info!(
+            "network link up; waiting up to {} seconds for DHCP",
+            DHCP_TIMEOUT_SECS
+        );
+
+        match await_with_fault_flash(
+            with_timeout(
+                Duration::from_secs(DHCP_TIMEOUT_SECS),
+                stack.wait_config_up(),
+            ),
+            control,
+            led,
+        )
+        .await
+        {
+            Ok(()) => break,
+            Err(_) => {
+                log::error!(
+                    "DHCP timed out after {} seconds; leaving Wi-Fi before retry",
+                    DHCP_TIMEOUT_SECS
+                );
+                control.leave().await;
                 show_led_status(control, led, LedStatus::Fault).await;
             }
         }
@@ -326,12 +368,6 @@ async fn connect_wifi(
         log::info!("retrying Wi-Fi join in 5 seconds");
         flash_fault_for(control, led, Duration::from_secs(5)).await;
     }
-
-    log::info!("waiting for network link");
-    await_with_fault_flash(stack.wait_link_up(), control, led).await;
-    log::info!("network link up; waiting for DHCP");
-
-    await_with_fault_flash(stack.wait_config_up(), control, led).await;
 
     match stack.config_v4() {
         Some(ipv4_config) => {
@@ -760,36 +796,85 @@ async fn drain_queue(
         };
         let publication = minimq::Publication::bytes(runtime.config.mqtt_topic, payload)
             .qos(minimq::QoS::AtLeastOnce);
-        let operation = match connection.publish(publication).await {
-            Ok(Some(operation)) => operation,
-            Ok(None) => {
+        log::info!(
+            "submitting queued MQTT publish: sequence={} depth={}",
+            record.sequence,
+            runtime.queue.depth()
+        );
+        let operation = match with_timeout(
+            Duration::from_secs(MQTT_PUBLISH_TIMEOUT_SECS),
+            connection.publish(publication),
+        )
+        .await
+        {
+            Ok(Ok(Some(operation))) => operation,
+            Ok(Ok(None)) => {
                 log::error!("QoS 1 publish returned no operation handle");
                 return false;
             }
-            Err(error) => {
-                log::error!("queued MQTT publish failed: {:?}", error);
+            Ok(Err(error)) => {
+                log::error!(
+                    "queued MQTT publish submission failed: sequence={} depth={} error={:?}",
+                    record.sequence,
+                    runtime.queue.depth(),
+                    error
+                );
+                return false;
+            }
+            Err(_) => {
+                log::error!(
+                    "queued MQTT publish submission timed out after {} seconds: sequence={} depth={}",
+                    MQTT_PUBLISH_TIMEOUT_SECS,
+                    record.sequence,
+                    runtime.queue.depth()
+                );
                 return false;
             }
         };
+        let puback_deadline = Instant::now() + Duration::from_secs(MQTT_PUBLISH_TIMEOUT_SECS);
         while connection.is_pending(&operation) {
-            match select(connection.poll(), Timer::at(runtime.next_sample_at)).await {
-                Either::First(Ok(_)) => {}
-                Either::First(Err(error)) => {
-                    log::error!("MQTT failed while awaiting PUBACK: {:?}", error);
+            match select3(
+                connection.poll(),
+                Timer::at(runtime.next_sample_at),
+                Timer::at(puback_deadline),
+            )
+            .await
+            {
+                Either3::First(Ok(_)) => {}
+                Either3::First(Err(error)) => {
+                    log::error!(
+                        "MQTT failed while awaiting PUBACK: sequence={} depth={} error={:?}",
+                        record.sequence,
+                        runtime.queue.depth(),
+                        error
+                    );
                     return false;
                 }
-                Either::Second(()) => {
+                Either3::Second(()) => {
                     capture_and_enqueue(runtime, control, led).await;
+                }
+                Either3::Third(()) => {
+                    log::error!(
+                        "MQTT PUBACK timed out after {} seconds: sequence={} depth={}",
+                        MQTT_PUBLISH_TIMEOUT_SECS,
+                        record.sequence,
+                        runtime.queue.depth()
+                    );
+                    return false;
                 }
             }
         }
         if !connection.is_complete(&operation) {
-            log::error!("queued MQTT publish was not acknowledged");
+            log::error!(
+                "queued MQTT publish operation ended without PUBACK: sequence={} depth={}",
+                record.sequence,
+                runtime.queue.depth()
+            );
             return false;
         }
         match runtime.queue.acknowledge_oldest() {
             Ok(_) => log::info!(
-                "replayed queued measurement: sequence={} remaining={}",
+                "MQTT PUBACK received; retired queued measurement: sequence={} remaining={}",
                 record.sequence,
                 runtime.queue.depth()
             ),
@@ -950,39 +1035,66 @@ async fn run_connected_session(
 
         loop {
             let utc_refresh_due = loop {
-                match select3(
-                    Timer::at(runtime.next_sample_at),
-                    select(
-                        connection.poll(),
-                        Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
-                    ),
-                    Timer::at(runtime.clock.next_refresh_at),
-                )
-                .await
-                {
-                    Either3::First(()) => {
+                enum ConnectedEvent {
+                    SampleDue,
+                    MqttProgress,
+                    MqttFailed,
+                    UtcRefreshDue,
+                }
+
+                let event = {
+                    // Keep the same MQTT poll future alive across LED ticks. Dropping and
+                    // recreating it every 100 ms needlessly cancels transport I/O.
+                    let mut mqtt_poll = pin!(connection.poll());
+                    loop {
+                        match select(
+                            select3(
+                                mqtt_poll.as_mut(),
+                                Timer::at(runtime.next_sample_at),
+                                Timer::at(runtime.clock.next_refresh_at),
+                            ),
+                            Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
+                        )
+                        .await
+                        {
+                            Either::First(Either3::First(Ok(Some(_publication)))) => {
+                                log::info!("received an unexpected MQTT publication while waiting");
+                                break ConnectedEvent::MqttProgress;
+                            }
+                            Either::First(Either3::First(Ok(None))) => {
+                                // Minimq made internal progress, such as keepalive traffic.
+                                break ConnectedEvent::MqttProgress;
+                            }
+                            Either::First(Either3::First(Err(error))) => {
+                                log::error!(
+                                    "MQTT session service failed while waiting for next sample: {:?}",
+                                    error
+                                );
+                                break ConnectedEvent::MqttFailed;
+                            }
+                            Either::First(Either3::Second(())) => {
+                                break ConnectedEvent::SampleDue;
+                            }
+                            Either::First(Either3::Third(())) => {
+                                break ConnectedEvent::UtcRefreshDue;
+                            }
+                            Either::Second(()) => {
+                                if led.status() == LedStatus::Fault {
+                                    tick_fault_led(control, led).await;
+                                }
+                            }
+                        }
+                    }
+                };
+
+                match event {
+                    ConnectedEvent::SampleDue => {
                         capture_and_enqueue(runtime, control, led).await;
                         break false;
                     }
-                    Either3::Second(Either::First(Ok(Some(_publication)))) => {
-                        log::info!("received an unexpected MQTT publication while waiting");
-                    }
-                    Either3::Second(Either::First(Ok(None))) => {
-                        // Minimq made internal progress, such as keepalive traffic.
-                    }
-                    Either3::Second(Either::First(Err(error))) => {
-                        log::error!(
-                            "MQTT session service failed while waiting for next sample: {:?}",
-                            error
-                        );
-                        break 'publishing;
-                    }
-                    Either3::Second(Either::Second(())) => {
-                        if led.status() == LedStatus::Fault {
-                            tick_fault_led(control, led).await;
-                        }
-                    }
-                    Either3::Third(()) => {
+                    ConnectedEvent::MqttProgress => {}
+                    ConnectedEvent::MqttFailed => break 'publishing,
+                    ConnectedEvent::UtcRefreshDue => {
                         log::info!("UTC refresh deadline reached");
                         break true;
                     }
@@ -1135,7 +1247,11 @@ async fn run_supervisor(
                     mqtt_socket.remote_endpoint()
                 );
 
-                mqtt_socket.set_timeout(None);
+                mqtt_socket.set_timeout(Some(Duration::from_secs(MQTT_CONNECTED_TCP_TIMEOUT_SECS)));
+                log::info!(
+                    "MQTT TCP receive-inactivity timeout set to {} seconds",
+                    MQTT_CONNECTED_TCP_TIMEOUT_SECS
+                );
 
                 match await_with_fault_flash(
                     with_timeout(
@@ -1153,6 +1269,10 @@ async fn run_supervisor(
                         reconnect_backoff.reset();
 
                         run_connected_session(app, control, led, &mut connection).await;
+                        log::error!(
+                            "MQTT connected session ended; dropping transport with queue depth {}",
+                            app.queue.depth()
+                        );
                     }
                     Ok(Err(error)) => {
                         log::error!("MQTT session establishment failed: {:?}", error);
