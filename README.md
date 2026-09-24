@@ -332,7 +332,7 @@ The application is supervised indefinitely rather than stopping after a fixed nu
 Recovery discards state from the failed layer upward:
 
 - A failed SHT40 read skips one publication and retries at the next 60-second sample without dropping a healthy MQTT session.
-- A broker DNS, TCP, MQTT handshake, publish, keepalive, or disconnect failure drops the MQTT connection and TCP socket while the 60-second sampler continues appending timestamped readings to flash. The next attempt resolves the broker again, creates fresh transport state, and replays the backlog before newly captured readings.
+- A broker DNS, TCP, MQTT handshake, publish, keepalive, or disconnect failure drops the MQTT connection and TCP socket while the 60-second sampler continues appending timestamped readings to flash. MQTT publish submission and PUBACK waits each have a 15-second deadline, and connected sockets have a 120-second receive-inactivity timeout. The next attempt resolves the broker again, creates fresh transport state, and replays the backlog before newly captured readings.
 - A lost Wi-Fi link explicitly clears stale CYW43439 association state, then returns to Wi-Fi join and DHCP before DNS, NTP, TCP, and MQTT are rebuilt.
 - A UTC refresh failure retains the last valid clock anchor and retries with the same bounded-backoff policy. A successful refresh resets that backoff and schedules the next daily refresh.
 
@@ -370,6 +370,8 @@ Keep the USB serial monitor and MQTT subscriber visible during each check. Do no
 5. Confirm any duplicate carries the same sequence number and that recovery requires no manual reset.
 
 If the broker repeatedly reports a timeout, confirm the firmware services the MQTT connection between samples and that its keepalive is not being blocked by a firewall or container networking rule.
+
+The USB log distinguishes `publish submission timed out`, `PUBACK timed out`, MQTT session-service failures, and TCP connection failures. Publish-timeout messages include the affected sequence number and current queue depth; the record remains queued for replay after reconnection.
 
 ### Wi-Fi interruption
 
