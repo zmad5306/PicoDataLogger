@@ -1,5 +1,6 @@
 param(
-    [string]$MountPoint
+    [string]$MountPoint,
+    [string]$SerialPort
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +21,18 @@ function Get-UsbSerialPorts {
             Get-ChildItem -Path $pattern -ErrorAction SilentlyContinue |
                 ForEach-Object { $_.FullName }
         }
+    ) | Sort-Object -Unique
+}
+
+function Get-PicoUsbSerialPorts {
+    if (-not $IsWindows) {
+        return @()
+    }
+
+    return @(
+        Get-CimInstance Win32_SerialPort -ErrorAction SilentlyContinue |
+            Where-Object { $_.PNPDeviceID -like "USB\VID_C0DE&PID_CAFE*" } |
+            ForEach-Object { $_.DeviceID }
     ) | Sort-Object -Unique
 }
 
@@ -57,6 +70,7 @@ function Start-SerialMonitor {
 
     $serialPort = [System.IO.Ports.SerialPort]::new($PortName, 115200)
     $serialPort.ReadTimeout = 250
+    $serialPort.Encoding = [System.Text.Encoding]::UTF8
 
     Write-Host "Starting serial monitor on $PortName. Stop with Ctrl-C."
     $serialPort.Open()
@@ -179,19 +193,45 @@ if (-not $bootselDisappeared) {
 Write-Host "Firmware copied and the Pico rebooted. Waiting for USB serial..."
 foreach ($attempt in 1..10) {
     $portsAfter = @(Get-UsbSerialPorts)
+
+    if ($SerialPort -and $SerialPort -in $portsAfter) {
+        Start-SerialMonitor -PortName $SerialPort
+        exit 0
+    }
+
+    $picoPorts = @(Get-PicoUsbSerialPorts)
+    if ($picoPorts.Count -eq 1) {
+        Write-Host "Pico USB serial device: $($picoPorts[0])"
+        Start-SerialMonitor -PortName $picoPorts[0]
+        exit 0
+    }
+    if ($picoPorts.Count -gt 1) {
+        throw "Multiple Pico USB serial devices were found: $($picoPorts -join ', '). Rerun with -SerialPort to select one."
+    }
+
     $newPorts = @($portsAfter | Where-Object { $_ -notin $portsBefore })
-    if ($newPorts.Count -gt 0) {
-        Write-Host "New serial device: $($newPorts -join ', ')"
+    if (-not $IsWindows -and $newPorts.Count -eq 1) {
+        Write-Host "New serial device: $($newPorts[0])"
         Start-SerialMonitor -PortName $newPorts[0]
         exit 0
     }
-    if ($portsAfter.Count -gt 0) {
-        Write-Host "Available serial device: $($portsAfter -join ', ')"
-        Write-Host "The Pico may have reused its previous device name."
-        Start-SerialMonitor -PortName $portsAfter[0]
-        exit 0
-    }
     Start-Sleep -Seconds 1
+}
+
+if ($SerialPort) {
+    throw "The requested serial device $SerialPort did not appear after the Pico rebooted."
+}
+
+$portsAfter = @(Get-UsbSerialPorts)
+if ($portsAfter.Count -eq 1) {
+    Write-Host "Available serial device: $($portsAfter[0])"
+    Write-Host "The Pico may have reused its previous device name."
+    Start-SerialMonitor -PortName $portsAfter[0]
+    exit 0
+}
+if ($portsAfter.Count -gt 1) {
+    Write-Warning "Firmware was flashed, but the Pico serial device could not be identified among: $($portsAfter -join ', '). Rerun with -SerialPort."
+    exit 2
 }
 
 Write-Warning "Firmware was flashed, but no USB serial device appeared. Check the operating system's USB and serial-device inventory."

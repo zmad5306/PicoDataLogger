@@ -147,6 +147,12 @@ The PowerShell script detects the standard `RP2350` mount location for the curre
 
 On Windows, an explicit mount point uses its drive-letter path, such as `-MountPoint R:\`.
 
+The Windows script identifies the running firmware by its USB VID/PID instead of choosing the first COM port. If more than one Pico running this firmware is connected, select the intended port explicitly:
+
+```powershell
+./scripts/deploy.ps1 -SerialPort COM3
+```
+
 The manual macOS workflow below documents each operation performed by the scripts.
 
 ### 1. Build the release ELF
