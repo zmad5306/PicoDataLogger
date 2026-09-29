@@ -153,6 +153,34 @@ The Windows script identifies the running firmware by its USB VID/PID instead of
 ./scripts/deploy.ps1 -SerialPort COM3
 ```
 
+### Monitor without flashing
+
+To attach to a Pico that is already running, use the standalone monitor for your development machine.
+
+On macOS with Bash:
+
+```sh
+bash ./scripts/monitor-macos.sh
+```
+
+On Windows with PowerShell 7:
+
+```powershell
+./scripts/monitor.ps1
+```
+
+Both scripts require exactly one matching device unless a serial device is supplied explicitly:
+
+```sh
+bash ./scripts/monitor-macos.sh /dev/cu.usbmodem101
+```
+
+```powershell
+./scripts/monitor.ps1 -SerialPort COM3
+```
+
+The macOS monitor uses `screen`; exit it with `Ctrl-A`, then `K`, then `Y`. Stop the PowerShell monitor with `Ctrl-C`.
+
 The manual macOS workflow below documents each operation performed by the scripts.
 
 ### 1. Build the release ELF

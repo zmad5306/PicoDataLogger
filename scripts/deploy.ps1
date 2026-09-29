@@ -72,8 +72,30 @@ function Start-SerialMonitor {
     $serialPort.ReadTimeout = 250
     $serialPort.Encoding = [System.Text.Encoding]::UTF8
 
+    $openError = $null
+    foreach ($attempt in 1..10) {
+        try {
+            $serialPort.Open()
+            $openError = $null
+            break
+        }
+        catch {
+            $openError = $_.Exception.GetBaseException().Message
+            if ($attempt -eq 1) {
+                Write-Warning "$PortName is not ready or is in use; retrying for up to 10 seconds."
+            }
+            if ($attempt -lt 10) {
+                Start-Sleep -Seconds 1
+            }
+        }
+    }
+
+    if (-not $serialPort.IsOpen) {
+        $serialPort.Dispose()
+        throw "Could not open $PortName after 10 attempts. Close any other serial monitor using the port and retry. Last error: $openError"
+    }
+
     Write-Host "Starting serial monitor on $PortName. Stop with Ctrl-C."
-    $serialPort.Open()
     try {
         while ($true) {
             $text = $serialPort.ReadExisting()
