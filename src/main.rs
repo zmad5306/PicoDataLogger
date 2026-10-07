@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod voltage;
+
 use core::future::Future;
 use core::pin::pin;
 use cyw43::aligned_bytes;
@@ -40,7 +42,7 @@ const MQTT_PUBLISH_TIMEOUT_SECS: u64 = 15;
 const MQTT_PACKET_RX_BUFFER_SIZE: usize = 512;
 const MQTT_PACKET_TX_BUFFER_SIZE: usize = 1024;
 const MQTT_KEEPALIVE_SECS: u16 = 90;
-const READING_JSON_BUFFER_SIZE: usize = 256;
+const READING_JSON_BUFFER_SIZE: usize = 384;
 const PUBLISH_INTERVAL_SECS: u64 = 60;
 const UTC_REFRESH_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const WIFI_JOIN_TIMEOUT_SECS: u64 = 15;
@@ -49,6 +51,7 @@ const FLASH_SIZE: usize = 4 * 1024 * 1024;
 const STORAGE_OFFSET: u32 = 0x003c_0000;
 const STORAGE_LENGTH: u32 = 256 * 1024;
 const LED_GPIO: u8 = 0;
+const VBUS_SENSE_GPIO: u8 = 2;
 const FAULT_FLASH_INTERVAL_MS: u64 = 100;
 
 bind_interrupts!(struct Irqs {
@@ -269,7 +272,7 @@ async fn logger_task(driver: UsbDriver) -> ! {
 
 #[embassy_executor::task]
 async fn cyw43_task(
-    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>>,
+    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, voltage::VoltageSpi>>,
 ) -> ! {
     runner.run().await;
 }
@@ -685,6 +688,8 @@ async fn capture_reading<'a>(
         sequence,
         temperature_c,
         relative_humidity_pct,
+        vsys_voltage_v: None,
+        on_battery: None,
         timestamp_unix_s,
         uptime_s: started_at.elapsed().as_secs(),
     };
@@ -720,16 +725,30 @@ async fn capture_and_enqueue(
     .await;
     runtime.next_sample_at += Duration::from_secs(PUBLISH_INTERVAL_SECS);
 
-    let Some(reading) = reading else {
+    let Some(mut reading) = reading else {
         show_led_status(control, led, LedStatus::Fault).await;
         return false;
     };
+    reading.on_battery = with_timeout(Duration::from_secs(1), control.gpio_get(VBUS_SENSE_GPIO))
+        .await
+        .ok()
+        .flatten()
+        .map(|usb_present| !usb_present);
+    if reading.on_battery.is_none() {
+        log::warn!("USB power sensing unavailable; publishing null on_battery");
+    }
+    reading.vsys_voltage_v = voltage::read_voltage().await;
+    if reading.vsys_voltage_v.is_none() {
+        log::warn!("VSYS measurement unavailable; publishing null voltage");
+    }
     let previous_dropped = runtime.queue.dropped();
     match runtime.queue.append(
         reading.timestamp_unix_s,
         reading.temperature_c,
         reading.relative_humidity_pct,
         reading.uptime_s,
+        reading.vsys_voltage_v,
+        reading.on_battery,
     ) {
         Ok(record) => {
             if runtime.queue.dropped() != previous_dropped {
@@ -762,6 +781,8 @@ fn queued_reading<'a>(
         sequence: record.sequence,
         temperature_c: record.temperature_c,
         relative_humidity_pct: record.relative_humidity_pct,
+        vsys_voltage_v: record.vsys_voltage_v,
+        on_battery: record.on_battery,
         timestamp_unix_s: record.timestamp_unix_s,
         uptime_s: record.uptime_s,
     }
@@ -1373,6 +1394,8 @@ async fn main(spawner: Spawner) {
         p.PIN_29,
         dma::Channel::new(p.DMA_CH0, Irqs),
     );
+
+    let spi = voltage::VoltageSpi::new(spi, p.ADC);
 
     static CYW43_STATE: StaticCell<cyw43::State> = StaticCell::new();
     static NETWORK_RESOURCES: StaticCell<embassy_net::StackResources<4>> = StaticCell::new();

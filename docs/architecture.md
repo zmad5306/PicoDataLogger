@@ -46,7 +46,7 @@ The linker divides the Pico 2 W's 4 MiB external flash into two non-overlapping 
 
 The measurement-storage region occupies the final 64 4-KiB erase sectors. Its start and size are erase-aligned so queue code can erase sectors without touching firmware bytes. `memory.x` fails the link if the firmware image reaches the reserved region and exports `__storage_start` and `__storage_end` for the flash driver integration.
 
-Each append-only record occupies one 256-byte page. A CRC-32 protects its versioned contents, and a commit marker is written last so recovery can reject interrupted writes. Acknowledgment clears another state bit after MQTT PUBACK. The queue keeps one sector as circular working space, batches erases by 16 records, and reconstructs ordering by sequence number after reboot. Its usable capacity is 1,008 readings, or 16 hours and 48 minutes at the 60-second interval.
+Each append-only record occupies one 256-byte page. Version 2 adds the VSYS voltage captured with the sensor measurement; version 1 records remain readable with an unavailable (`null`) voltage. Version 3 adds an optional `on_battery` flag in a checksummed reserved byte; versions 1 and 2 decode that flag as unknown. A CRC-32 protects its versioned contents, and a commit marker is written last so recovery can reject interrupted writes. Acknowledgment clears another state bit after MQTT PUBACK. The queue keeps one sector as circular working space, batches erases by 16 records, and reconstructs ordering by sequence number after reboot. Its usable capacity is 1,008 readings, or 16 hours and 48 minutes at the 60-second interval.
 
 ## Runtime tasks
 
@@ -101,7 +101,8 @@ flowchart LR
 ```
 
 - I2C transports sensor commands and measurements.
-- `Reading` gives the measurement a typed representation.
+- `Reading` gives the measurement a typed representation, including optional `vsys_voltage_v` and `on_battery`. Power-source detection reads CYW43439 WL_GPIO2 (USB VBUS present) through the control task before each voltage sample, with a one-second timeout. Both values are persisted before publication.
+- `voltage::VoltageSpi` wraps the radio SPI bus and handles ADC3 requests only between completed transactions with CS high. It disables GPIO29 digital pad functions during a synchronous, averaged ADC read, restores the pad, and resumes SPI. The application waits at most one second and records `null` on failure; it never substitutes an old voltage.
 - `serde-json-core` serializes into caller-owned fixed storage.
 - MQTT defines the topic, publication, session, and keepalive behavior.
 - TCP provides MQTT with an ordered byte stream.
@@ -127,7 +128,7 @@ The firmware reuses fixed-size storage instead of allocating per operation:
 
 | Buffer | Size | Purpose |
 | --- | ---: | --- |
-| Reading JSON | 128 bytes | Serialized sensor payload. |
+| Reading JSON | 384 bytes | Serialized sensor and VSYS-voltage payload. |
 | TCP receive | 1024 bytes | MQTT transport input. |
 | TCP transmit | 1024 bytes | MQTT transport output. |
 | MQTT packet receive | 512 bytes | MQTT decoder storage. |

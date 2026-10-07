@@ -16,6 +16,7 @@ cyw43 = { version = "0.7", features = ["log"] }
 cyw43-pio = "0.10"
 embassy-executor = "0.10"
 embassy-futures = "0.1"
+embassy-sync = "0.8"
 embassy-time = "0.5"
 embassy-usb = "0.6"
 embassy-usb-logger = "0.6"
@@ -30,6 +31,7 @@ minimq = { version = "0.13", default-features = false }
 version = "0.10"
 features = [
     "rp235xa",
+    "unstable-pac",
     "time-driver",
     "critical-section-impl",
     "executor-thread",
@@ -42,6 +44,5 @@ lto = "fat"
 opt-level = "s"
 
 [patch.crates-io]
-# Local, narrowly scoped extension: keep WL_GPIO0 flashing while Control::join
-# waits for association events. See vendor/cyw43/README-PICODATALOGGER.md.
+# Local extensions: LED flashing during association and GPIO input sensing. See vendor/cyw43/README-PICODATALOGGER.md.
 cyw43 = { path = "vendor/cyw43" }

@@ -16,6 +16,10 @@ pub struct Reading<'a> {
     pub sequence: u64,
     pub temperature_c: f32,
     pub relative_humidity_pct: f32,
+    /// VSYS at capture time in volts; absent for legacy records or failed ADC reads.
+    pub vsys_voltage_v: Option<f32>,
+    /// True when USB VBUS is absent; None if unavailable or not recorded.
+    pub on_battery: Option<bool>,
     /// UTC time when this measurement was taken
     pub timestamp_unix_s: u64,
     /// Seconds since boot, retained for reboot and timing diagnostics.
@@ -81,6 +85,8 @@ mod tests {
             sequence: 42,
             temperature_c: 23.4,
             relative_humidity_pct: 45.6,
+            vsys_voltage_v: Some(2.85),
+            on_battery: Some(true),
             timestamp_unix_s: 1_700_000_000,
             uptime_s: 120,
         }
@@ -106,8 +112,37 @@ mod tests {
 
         assert_eq!(
             encoded,
-            br#"{"device_id":"basement-sensor","hardware_id":"0123456789abcdef","sequence":42,"temperature_c":23.4,"relative_humidity_pct":45.6,"timestamp_unix_s":1700000000,"uptime_s":120}"#
+            br#"{"device_id":"basement-sensor","hardware_id":"0123456789abcdef","sequence":42,"temperature_c":23.4,"relative_humidity_pct":45.6,"vsys_voltage_v":2.85,"on_battery":true,"timestamp_unix_s":1700000000,"uptime_s":120}"#
         );
+    }
+
+    #[test]
+    fn power_source_is_boolean_or_null() {
+        let mut reading = example_reading();
+        assert_encoding_contains(&reading, br#""on_battery":true"#);
+        reading.on_battery = Some(false);
+        assert_encoding_contains(&reading, br#""on_battery":false"#);
+        reading.on_battery = None;
+        assert_encoding_contains(&reading, br#""on_battery":null"#);
+    }
+
+    #[test]
+    fn unavailable_voltage_is_json_null() {
+        let mut reading = example_reading();
+        reading.vsys_voltage_v = None;
+        assert_encoding_contains(&reading, br#""vsys_voltage_v":null"#);
+    }
+
+    #[test]
+    fn expanded_payload_fits_firmware_buffer_with_long_device_name() {
+        let mut reading = example_reading();
+        let device_id = [b'a'; 79];
+        reading.device_id = core::str::from_utf8(&device_id).unwrap();
+        reading.sequence = u64::MAX;
+        reading.timestamp_unix_s = u64::MAX;
+        reading.uptime_s = u64::MAX;
+        let mut buffer = [0_u8; 384];
+        assert!(encode_reading(&reading, &mut buffer).is_ok());
     }
 
     #[test]

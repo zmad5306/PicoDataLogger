@@ -483,6 +483,19 @@ impl<'a> Control<'a> {
         result
     }
 
+    /// Read a GPIO input on the WiFi chip using the driver's ccgpioin IOVAR.
+    /// Returns None for an invalid pin or a short response.
+    pub async fn gpio_get(&mut self, gpio_n: u8) -> Option<bool> {
+        if gpio_n >= 3 {
+            return None;
+        }
+        let mut buf = [0; 4];
+        if self.get_iovar("ccgpioin", &mut buf).await != 4 {
+            return None;
+        }
+        Some(u32::from_le_bytes(buf) & (1 << gpio_n) != 0)
+    }
+
     /// Set GPIO pin on WiFi chip.
     pub async fn gpio_set(&mut self, gpio_n: u8, gpio_en: bool) {
         assert!(gpio_n < 3);

@@ -2,7 +2,7 @@
 
 use embedded_storage::nor_flash::NorFlash;
 
-pub const RECORD_VERSION: u8 = 1;
+pub const RECORD_VERSION: u8 = 3;
 pub const RECORD_SIZE: usize = 256;
 pub const ERASE_SIZE: usize = 4096;
 const MAGIC: u32 = 0x514C_4450; // "PDLQ" in little endian.
@@ -16,6 +16,8 @@ pub struct MeasurementRecord {
     pub timestamp_unix_s: u64,
     pub temperature_c: f32,
     pub relative_humidity_pct: f32,
+    pub vsys_voltage_v: Option<f32>,
+    pub on_battery: Option<bool>,
     pub uptime_s: u64,
 }
 
@@ -124,6 +126,8 @@ where
         temperature_c: f32,
         relative_humidity_pct: f32,
         uptime_s: u64,
+        vsys_voltage_v: Option<f32>,
+        on_battery: Option<bool>,
     ) -> Result<MeasurementRecord, QueueError<F::Error>> {
         if self.depth == self.capacity() {
             self.remove_oldest()?;
@@ -134,6 +138,8 @@ where
             timestamp_unix_s,
             temperature_c,
             relative_humidity_pct,
+            vsys_voltage_v,
+            on_battery,
             uptime_s,
         };
         self.next_sequence = self.next_sequence.wrapping_add(1);
@@ -291,31 +297,63 @@ fn encode(record: MeasurementRecord) -> [u8; RECORD_SIZE] {
     let mut bytes = [0xff; RECORD_SIZE];
     bytes[0] = COMMITTED;
     bytes[1] = RECORD_VERSION;
+    bytes[2] = match record.on_battery {
+        None => 0xff,
+        Some(false) => 0,
+        Some(true) => 1,
+    };
     bytes[4..8].copy_from_slice(&MAGIC.to_le_bytes());
     bytes[8..16].copy_from_slice(&record.sequence.to_le_bytes());
     bytes[16..24].copy_from_slice(&record.timestamp_unix_s.to_le_bytes());
     bytes[24..28].copy_from_slice(&record.temperature_c.to_bits().to_le_bytes());
     bytes[28..32].copy_from_slice(&record.relative_humidity_pct.to_bits().to_le_bytes());
     bytes[32..40].copy_from_slice(&record.uptime_s.to_le_bytes());
-    let crc = crc32(&bytes[1..40]);
-    bytes[40..44].copy_from_slice(&crc.to_le_bytes());
+    bytes[40..44].copy_from_slice(
+        &record
+            .vsys_voltage_v
+            .unwrap_or(f32::NAN)
+            .to_bits()
+            .to_le_bytes(),
+    );
+    let crc = crc32(&bytes[1..44]);
+    bytes[44..48].copy_from_slice(&crc.to_le_bytes());
     bytes
 }
 
 fn decode(bytes: &[u8; RECORD_SIZE]) -> Option<MeasurementRecord> {
-    if bytes[1] != RECORD_VERSION || u32::from_le_bytes(bytes[4..8].try_into().ok()?) != MAGIC {
+    if !matches!(bytes[1], 1 | 2 | RECORD_VERSION)
+        || u32::from_le_bytes(bytes[4..8].try_into().ok()?) != MAGIC
+    {
         return None;
     }
-    let expected = u32::from_le_bytes(bytes[40..44].try_into().ok()?);
-    if crc32(&bytes[1..40]) != expected {
+    let crc_offset = if bytes[1] == 1 { 40 } else { 44 };
+    let expected = u32::from_le_bytes(bytes[crc_offset..crc_offset + 4].try_into().ok()?);
+    if crc32(&bytes[1..crc_offset]) != expected {
         return None;
     }
+    let on_battery = if bytes[1] < 3 {
+        None
+    } else {
+        match bytes[2] {
+            0xff => None,
+            0 => Some(false),
+            1 => Some(true),
+            _ => return None,
+        }
+    };
     Some(MeasurementRecord {
+        on_battery,
         sequence: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
         timestamp_unix_s: u64::from_le_bytes(bytes[16..24].try_into().ok()?),
         temperature_c: f32::from_bits(u32::from_le_bytes(bytes[24..28].try_into().ok()?)),
         relative_humidity_pct: f32::from_bits(u32::from_le_bytes(bytes[28..32].try_into().ok()?)),
         uptime_s: u64::from_le_bytes(bytes[32..40].try_into().ok()?),
+        vsys_voltage_v: if bytes[1] == 1 {
+            None
+        } else {
+            let voltage = f32::from_bits(u32::from_le_bytes(bytes[40..44].try_into().ok()?));
+            voltage.is_finite().then_some(voltage)
+        },
     })
 }
 
@@ -404,8 +442,80 @@ mod tests {
     }
     fn append(queue: &mut FlashQueue<FakeFlash>, value: u64) -> MeasurementRecord {
         queue
-            .append(1_700_000_000 + value, value as f32, 50.0, value)
+            .append(
+                1_700_000_000 + value,
+                value as f32,
+                50.0,
+                value,
+                Some(2.85),
+                Some(true),
+            )
             .unwrap()
+    }
+
+    #[test]
+    fn mixed_legacy_and_voltage_records_survive_reboot() {
+        let mut q = queue();
+        let mut legacy = append(&mut q, 1);
+        let current = append(&mut q, 2);
+        let mut flash = q.into_inner();
+        // Recreate the original v1 wire format and checksum.
+        flash.bytes[1] = 1;
+        flash.bytes[2] = 0xff;
+        let crc = crc32(&flash.bytes[1..40]);
+        flash.bytes[40..44].copy_from_slice(&crc.to_le_bytes());
+        flash.bytes[44..RECORD_SIZE].fill(0xff);
+        legacy.vsys_voltage_v = None;
+        legacy.on_battery = None;
+        let (mut recovered, report) =
+            FlashQueue::recover(flash, 0, (ERASE_SIZE * 3) as u32).unwrap();
+        assert_eq!(report.depth, 2);
+        assert_eq!(report.corrupt_records, 0);
+        assert_eq!(report.next_sequence, 2);
+        assert_eq!(recovered.acknowledge_oldest().unwrap(), Some(legacy));
+        assert_eq!(recovered.peek_oldest().unwrap(), Some(current));
+    }
+
+    #[test]
+    fn voltage_is_checksummed_and_missing_voltage_round_trips() {
+        let mut q = queue();
+        let record = q.append(1, 2.0, 3.0, 4, None, None).unwrap();
+        assert_eq!(decode(&encode(record)), Some(record));
+        let record = append(&mut q, 1);
+        let mut bytes = encode(record);
+        bytes[40] ^= 1;
+        assert_eq!(decode(&bytes), None);
+    }
+
+    #[test]
+    fn version_two_retains_voltage_without_inventing_power_source() {
+        let mut q = queue();
+        let mut old = append(&mut q, 1);
+        let current = q.append(2, 20.0, 50.0, 2, Some(4.8), Some(false)).unwrap();
+        let mut flash = q.into_inner();
+        flash.bytes[1] = 2;
+        flash.bytes[2] = 0xff;
+        let crc = crc32(&flash.bytes[1..44]);
+        flash.bytes[44..48].copy_from_slice(&crc.to_le_bytes());
+        old.on_battery = None;
+        let (mut recovered, report) =
+            FlashQueue::recover(flash, 0, (ERASE_SIZE * 3) as u32).unwrap();
+        assert_eq!(report.depth, 2);
+        assert_eq!(report.corrupt_records, 0);
+        assert_eq!(recovered.acknowledge_oldest().unwrap(), Some(old));
+        assert_eq!(recovered.peek_oldest().unwrap(), Some(current));
+    }
+
+    #[test]
+    fn battery_flag_survives_reboot_and_is_checksummed() {
+        let mut q = queue();
+        let battery = append(&mut q, 1);
+        let (mut recovered, _) =
+            FlashQueue::recover(q.into_inner(), 0, (ERASE_SIZE * 3) as u32).unwrap();
+        assert_eq!(recovered.peek_oldest().unwrap(), Some(battery));
+        let mut bytes = encode(battery);
+        bytes[2] = 0;
+        assert_eq!(decode(&bytes), None);
     }
 
     #[test]
@@ -473,7 +583,7 @@ mod tests {
     fn interrupted_body_write_is_ignored() {
         let mut q = queue();
         q.flash.fail_after = Some(q.flash.writes + 1);
-        assert!(q.append(1, 2.0, 3.0, 4).is_err());
+        assert!(q.append(1, 2.0, 3.0, 4, None, None).is_err());
         let flash = q.into_inner();
         let (_, report) = FlashQueue::recover(flash, 0, (ERASE_SIZE * 3) as u32).unwrap();
         assert_eq!(report.depth, 0);

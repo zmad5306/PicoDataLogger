@@ -338,7 +338,7 @@ docker exec -it <mosquitto-container> \
 Use the configured host, port, topic, and authentication flags when they differ from the defaults. A reading has this shape:
 
 ```json
-{"device_id":"basement-sensor","hardware_id":"0123456789abcdef","sequence":42,"temperature_c":21.34,"relative_humidity_pct":43.13,"timestamp_unix_s":1789916205,"uptime_s":16}
+{"device_id":"basement-sensor","hardware_id":"0123456789abcdef","sequence":42,"temperature_c":21.34,"relative_humidity_pct":43.13,"vsys_voltage_v":2.85,"on_battery":true,"timestamp_unix_s":1789916205,"uptime_s":16}
 ```
 
 | Field | Meaning |
@@ -348,14 +348,30 @@ Use the configured host, port, topic, and authentication flags when they differ 
 | `sequence` | Monotonically increasing record identifier; repeated values identify at-least-once replay after a reset. |
 | `temperature_c` | SHT40 temperature in degrees Celsius. |
 | `relative_humidity_pct` | SHT40 relative humidity percentage. |
+| `vsys_voltage_v` | Estimated VSYS voltage in volts, captured with the reading; `null` if sampling fails or the record predates voltage monitoring. |
+| `on_battery` | Boolean: `true` when USB VBUS is absent, `false` when present; `null` for unavailable sensing or older records. |
 | `timestamp_unix_s` | UTC Unix timestamp captured with the measurement. |
 | `uptime_s` | Whole seconds since this firmware booted. |
 
 The MQTT connection client ID combines both identities as `<device_id>-<hardware_id>`, preventing two physical Picos with the same human-readable configuration from disconnecting each other. Publications use MQTT QoS 1 and are not retained. The firmware keeps each flash record until the broker acknowledges its publication. If power fails after broker delivery but before local retirement, that record is sent again after reboot; consumers should use `(hardware_id, sequence)` to recognize the duplicate. `device_id` remains convenient for human-facing grouping and can intentionally survive hardware replacement.
 
+### Supply-voltage telemetry
+
+`on_battery` reads the Pico 2 W's CYW43439 `WL_GPIO2` VBUS-sense input through `Control::gpio_get`, then inverts it. USB power present means `false`; USB power absent means `true`. This describes the USB-or-AA wiring used here: the board cannot identify whether a non-USB VSYS supply is a battery or another external supply, or directly measure which source supplies current in an arbitrary dual-supply circuit. Sensing does not depend on USB enumeration, a serial monitor, or a voltage threshold. A timed-out or short GPIO response produces `null`.
+
+For server-side battery alerts, require `on_battery == true`, a non-null `vsys_voltage_v`, and a recent capture timestamp.
+
+Every reading includes `vsys_voltage_v` for server-side low-battery alerts. The Pico 2 W measures VSYS/3 on ADC3/GPIO29, which also carries the CYW43439 SPI clock. The radio bus wrapper services voltage requests between completed SPI transactions, with chip select high. It temporarily disables the pin's digital pad, lets it settle, discards one ADC conversion, averages 16 conversions, and restores the original pad before resuming radio communication. A one-second request timeout produces `null` rather than a stale reading. This feature does not shut down the device or apply a local low-battery threshold.
+
+Conversion assumes a nominal 3.3 V ADC reference and the board's 3:1 divider; the result is rounded to millivolts but is not calibrated to millivolt accuracy. Compare telemetry against a multimeter before choosing alert thresholds. With a battery directly on VSYS and USB disconnected, this estimates pack voltage. With USB powering the board, it measures the USB-derived VSYS rail; with a blocking diode, it measures voltage after that diode. See the [Pico 2 W datasheet, sections 2.1 and 3.4–3.5](https://datasheets.raspberrypi.com/picow/pico-2-w-datasheet.pdf).
+
+Voltage and `on_battery` are persisted at capture time, so delayed MQTT replay retains the original values. New records use version 3. Versions 1 and 2 remain readable and publish `on_battery: null`; version 1 also publishes voltage as `null`. Server alerts should ignore null values and use `timestamp_unix_s` to avoid treating old replayed measurements as current battery status. A separate last-seen alert can detect a device that stops reporting altogether.
+
+Hardware acceptance: observe MQTT while running from batteries, compare `vsys_voltage_v` with a meter across VSYS/GND, and confirm publishing continues with wireless activity. Then interrupt broker access, collect readings, reboot, restore access, and confirm replay preserves their voltages and power-source flags. Verify new readings show `on_battery: true` on batteries and `false` on powered USB, including a USB charger without a serial connection. When switching to USB for diagnostics, disconnect a directly wired battery pack first unless the supply has the documented reverse-current protection. Compilation and host tests do not verify ADC accuracy or radio coexistence on the physical board.
+
 ### Offline queue capacity and wear
 
-The final 256 KiB of onboard flash is reserved for measurements and excluded from the firmware link region. Records occupy one 256-byte flash page and include a format version, sequence number, original Unix timestamp, temperature, humidity, uptime, and CRC-32 integrity check. One 4-KiB erase sector is retained as circular working space, leaving 1,008 usable records—16 hours and 48 minutes at one reading per minute.
+The final 256 KiB of onboard flash is reserved for measurements and excluded from the firmware link region. Records occupy one 256-byte flash page and include a format version, sequence number, original Unix timestamp, temperature, humidity, uptime, VSYS voltage, power-source flag, and CRC-32 integrity check. One 4-KiB erase sector is retained as circular working space, leaving 1,008 usable records—16 hours and 48 minutes at one reading per minute.
 
 Writes are append-only. A record becomes visible only after its body and checksum have been written and a final commit byte is programmed. Recovery ignores incomplete or corrupt records and reconstructs FIFO order from sequence numbers. Acknowledgment and commit markers only clear flash bits; sectors are erased in 16-record batches instead of once per measurement. When all 1,008 positions are occupied, the oldest measurement is explicitly discarded so newer outage data continues to be captured.
 
