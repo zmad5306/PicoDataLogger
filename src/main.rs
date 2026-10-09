@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+mod power;
 mod voltage;
 
 use core::future::Future;
@@ -8,7 +9,7 @@ use core::pin::pin;
 use cyw43::aligned_bytes;
 use cyw43_pio::{DEFAULT_CLOCK_DIVIDER, PioSpi};
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, Either3, select, select3};
+use embassy_futures::select::{Either, select, select3};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::dma;
@@ -31,7 +32,6 @@ use pico_data_logger::ntp::{
 use pico_data_logger::status::{LedStatus, LedStatusModel};
 use pico_data_logger::{Reading, compose_mqtt_client_id, encode_reading, format_hardware_id};
 use sht4x::{Precision, Sht4xAsync};
-use static_cell::StaticCell;
 
 const NTP_PORT: u16 = 123;
 const DHCP_TIMEOUT_SECS: u64 = 30;
@@ -43,7 +43,8 @@ const MQTT_PACKET_RX_BUFFER_SIZE: usize = 512;
 const MQTT_PACKET_TX_BUFFER_SIZE: usize = 1024;
 const MQTT_KEEPALIVE_SECS: u16 = 90;
 const READING_JSON_BUFFER_SIZE: usize = 384;
-const PUBLISH_INTERVAL_SECS: u64 = 60;
+const PUBLISH_INTERVAL_SECS: u64 = 15 * 60;
+const AWAKE_BUDGET_SECS: u64 = 60;
 const UTC_REFRESH_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const WIFI_JOIN_TIMEOUT_SECS: u64 = 15;
 const MQTT_EFFECTIVE_CLIENT_ID_SIZE: usize = 96;
@@ -55,6 +56,7 @@ const VBUS_SENSE_GPIO: u8 = 2;
 const FAULT_FLASH_INTERVAL_MS: u64 = 100;
 
 bind_interrupts!(struct Irqs {
+    POWMAN_IRQ_TIMER => embassy_rp::aon_timer::InterruptHandler;
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
     DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>;
@@ -90,22 +92,15 @@ struct ClockState {
 
 struct AppRuntime<'a> {
     config: &'a AppConfig,
-    stack: embassy_net::Stack<'static>,
+    stack: embassy_net::Stack<'a>,
     rng: &'a mut RoscRng,
     sensor: &'a mut Sensor,
     delay: &'a mut Delay,
     started_at: Instant,
-    clock: ClockState,
+    clock: &'a mut Option<ClockState>,
     reading_json_buffer: &'a mut [u8; READING_JSON_BUFFER_SIZE],
     hardware_id: &'a str,
     queue: &'a mut MeasurementQueue,
-    next_sample_at: Instant,
-}
-
-struct Supervisor<'a> {
-    app: AppRuntime<'a>,
-    control: &'a mut cyw43::Control<'static>,
-    led: LedStatusModel,
 }
 
 async fn show_led_status(
@@ -120,14 +115,6 @@ async fn show_led_status(
 async fn tick_fault_led(control: &mut cyw43::Control<'_>, led: &mut LedStatusModel) {
     led.tick();
     control.gpio_set(LED_GPIO, led.is_on()).await;
-}
-
-async fn flash_fault_forever(control: &mut cyw43::Control<'_>, led: &mut LedStatusModel) -> ! {
-    show_led_status(control, led, LedStatus::Fault).await;
-    loop {
-        Timer::after_millis(FAULT_FLASH_INTERVAL_MS).await;
-        tick_fault_led(control, led).await;
-    }
 }
 
 async fn flash_fault_for(
@@ -213,7 +200,7 @@ impl ResolveError {
 
 impl ClockAnchor {
     fn unix_now(&self) -> Result<u64, ClockError> {
-        unix_seconds_from_anchor(self.unix_seconds, self.monotonic.elapsed().as_secs())
+        unix_seconds_from_anchor(self.unix_seconds, (power::now() - self.monotonic).as_secs())
             .ok_or(ClockError::Overflow)
     }
 }
@@ -222,7 +209,7 @@ impl ClockState {
     fn new(anchor: ClockAnchor) -> Self {
         Self {
             anchor,
-            next_refresh_at: Instant::now() + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS),
+            next_refresh_at: power::now() + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS),
             refresh_backoff: RetryBackoff::new(),
         }
     }
@@ -268,18 +255,6 @@ impl AppConfig {
 #[embassy_executor::task]
 async fn logger_task(driver: UsbDriver) -> ! {
     embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver);
-}
-
-#[embassy_executor::task]
-async fn cyw43_task(
-    runner: cyw43::Runner<'static, cyw43::SpiBus<Output<'static>, voltage::VoltageSpi>>,
-) -> ! {
-    runner.run().await;
-}
-
-#[embassy_executor::task]
-async fn net_task(mut runner: embassy_net::Runner<'static, cyw43::NetDriver<'static>>) -> ! {
-    runner.run().await;
 }
 
 async fn connect_wifi(
@@ -503,7 +478,7 @@ async fn synchronize_clock(
 
                                             let anchor = ClockAnchor {
                                                 unix_seconds,
-                                                monotonic: Instant::now(),
+                                                monotonic: power::now(),
                                             };
 
                                             log::info!(
@@ -545,27 +520,6 @@ async fn synchronize_clock(
     }
 
     clock_anchor
-}
-
-async fn check_sensor(sensor: &mut Sensor, delay: &mut Delay) -> bool {
-    match sensor.serial_number(delay).await {
-        Ok(serial) => {
-            log::info!("SHT40 serial number: 0x{:08X}", serial);
-            true
-        }
-        Err(sht4x::Error::I2c(error)) => {
-            log::error!("SHT40 I2C error: {:?}", error);
-            false
-        }
-        Err(sht4x::Error::Crc) => {
-            log::error!("SHT40 serial number failed CRC validation");
-            false
-        }
-        Err(error) => {
-            log::error!("Unexpected SHT40 error: {:?}", error);
-            false
-        }
-    }
 }
 
 async fn synchronize_clock_until_ready(
@@ -623,12 +577,12 @@ async fn refresh_clock(
         Some(anchor) => {
             clock.anchor = anchor;
             clock.refresh_backoff.reset();
-            clock.next_refresh_at = Instant::now() + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS);
+            clock.next_refresh_at = power::now() + Duration::from_secs(UTC_REFRESH_INTERVAL_SECS);
             true
         }
         None => {
             let retry_delay_secs = clock.refresh_backoff.next_delay_secs();
-            clock.next_refresh_at = Instant::now() + Duration::from_secs(retry_delay_secs);
+            clock.next_refresh_at = power::now() + Duration::from_secs(retry_delay_secs);
             log::error!(
                 "UTC refresh failed; retaining last valid anchor and retrying in {} seconds",
                 retry_delay_secs
@@ -691,7 +645,7 @@ async fn capture_reading<'a>(
         vsys_voltage_v: None,
         on_battery: None,
         timestamp_unix_s,
-        uptime_s: started_at.elapsed().as_secs(),
+        uptime_s: (power::now() - started_at).as_secs(),
     };
 
     log::info!(
@@ -712,18 +666,20 @@ async fn capture_and_enqueue(
 ) -> bool {
     // A new sample attempt temporarily takes priority over a previous fault.
     show_led_status(control, led, LedStatus::Publishing).await;
+    let Some(clock) = runtime.clock.as_ref() else {
+        return false;
+    };
     let sequence = runtime.queue.next_sequence();
     let reading = capture_reading(
         runtime.sensor,
         runtime.delay,
-        &runtime.clock.anchor,
+        &clock.anchor,
         runtime.started_at,
         sequence,
         runtime.config.mqtt_client_id,
         runtime.hardware_id,
     )
     .await;
-    runtime.next_sample_at += Duration::from_secs(PUBLISH_INTERVAL_SECS);
 
     let Some(mut reading) = reading else {
         show_led_status(control, led, LedStatus::Fault).await;
@@ -795,9 +751,6 @@ async fn drain_queue(
     connection: &mut minimq::Connection<'_, '_, embassy_net::tcp::TcpSocket<'_>>,
 ) -> bool {
     loop {
-        while runtime.next_sample_at <= Instant::now() {
-            capture_and_enqueue(runtime, control, led).await;
-        }
         let record = match runtime.queue.peek_oldest() {
             Ok(Some(record)) => record,
             Ok(None) => return true,
@@ -854,15 +807,9 @@ async fn drain_queue(
         };
         let puback_deadline = Instant::now() + Duration::from_secs(MQTT_PUBLISH_TIMEOUT_SECS);
         while connection.is_pending(&operation) {
-            match select3(
-                connection.poll(),
-                Timer::at(runtime.next_sample_at),
-                Timer::at(puback_deadline),
-            )
-            .await
-            {
-                Either3::First(Ok(_)) => {}
-                Either3::First(Err(error)) => {
+            match select(connection.poll(), Timer::at(puback_deadline)).await {
+                Either::First(Ok(_)) => {}
+                Either::First(Err(error)) => {
                     log::error!(
                         "MQTT failed while awaiting PUBACK: sequence={} depth={} error={:?}",
                         record.sequence,
@@ -871,10 +818,7 @@ async fn drain_queue(
                     );
                     return false;
                 }
-                Either3::Second(()) => {
-                    capture_and_enqueue(runtime, control, led).await;
-                }
-                Either3::Third(()) => {
+                Either::Second(()) => {
                     log::error!(
                         "MQTT PUBACK timed out after {} seconds: sequence={} depth={}",
                         MQTT_PUBLISH_TIMEOUT_SECS,
@@ -910,105 +854,6 @@ async fn drain_queue(
     }
 }
 
-async fn wait_with_sampling(
-    runtime: &mut AppRuntime<'_>,
-    control: &mut cyw43::Control<'_>,
-    led: &mut LedStatusModel,
-    duration: Duration,
-) {
-    let deadline = Instant::now() + duration;
-    loop {
-        match select3(
-            Timer::at(deadline),
-            Timer::at(runtime.next_sample_at),
-            Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
-        )
-        .await
-        {
-            Either3::First(()) => return,
-            Either3::Second(()) => {
-                capture_and_enqueue(runtime, control, led).await;
-                show_led_status(control, led, LedStatus::Fault).await;
-            }
-            Either3::Third(()) => tick_fault_led(control, led).await,
-        }
-    }
-}
-
-async fn recover_wifi_with_sampling(
-    app: &mut AppRuntime<'_>,
-    control: &mut cyw43::Control<'_>,
-    led: &mut LedStatusModel,
-) {
-    loop {
-        let mut join_options = cyw43::JoinOptions::new(app.config.wifi_password.as_bytes());
-        join_options.auth = cyw43::JoinAuth::Wpa2;
-        match select3(
-            Timer::after_secs(WIFI_JOIN_TIMEOUT_SECS),
-            control.join_with_gpio_flash(
-                app.config.wifi_ssid,
-                join_options,
-                LED_GPIO,
-                Duration::from_millis(FAULT_FLASH_INTERVAL_MS),
-                led.is_on(),
-            ),
-            Timer::at(app.next_sample_at),
-        )
-        .await
-        {
-            Either3::First(()) => {
-                log::error!("Wi-Fi recovery join timed out");
-                control.leave().await;
-            }
-            Either3::Second(Ok(())) => {
-                show_led_status(control, led, LedStatus::Fault).await;
-                break;
-            }
-            Either3::Second(Err(error)) => log::error!("Wi-Fi recovery join failed: {:?}", error),
-            Either3::Third(()) => {
-                capture_and_enqueue(app, control, led).await;
-                show_led_status(control, led, LedStatus::Fault).await;
-                continue;
-            }
-        }
-        wait_with_sampling(app, control, led, Duration::from_secs(5)).await;
-    }
-
-    while !app.stack.is_link_up() {
-        match select3(
-            app.stack.wait_link_up(),
-            Timer::at(app.next_sample_at),
-            Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
-        )
-        .await
-        {
-            Either3::First(()) => {}
-            Either3::Second(()) => {
-                capture_and_enqueue(app, control, led).await;
-                show_led_status(control, led, LedStatus::Fault).await;
-            }
-            Either3::Third(()) => tick_fault_led(control, led).await,
-        }
-    }
-    while !app.stack.is_config_up() {
-        match select3(
-            app.stack.wait_config_up(),
-            Timer::at(app.next_sample_at),
-            Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
-        )
-        .await
-        {
-            Either3::First(()) => {}
-            Either3::Second(()) => {
-                capture_and_enqueue(app, control, led).await;
-                show_led_status(control, led, LedStatus::Fault).await;
-            }
-            Either3::Third(()) => tick_fault_led(control, led).await,
-        }
-    }
-    log::info!("Wi-Fi and DHCP recovered");
-}
-
 fn create_mqtt_session<'buffer>(
     config: &AppConfig,
     effective_client_id: &str,
@@ -1042,291 +887,147 @@ fn create_mqtt_session<'buffer>(
     Some(minimq::Session::new(builder))
 }
 
-async fn run_connected_session(
-    runtime: &mut AppRuntime<'_>,
+// All network futures are scoped to one wake cycle. Dropping this entire scope
+// also drops the radio runner, SPI/DMA transfers, and network stack; none of that
+// state is reused after a timeout or after the radio is powered down.
+async fn upload_cycle(
+    app: &mut AppRuntime<'_>,
     control: &mut cyw43::Control<'_>,
-    led: &mut LedStatusModel,
-    connection: &mut minimq::Connection<'_, '_, embassy_net::tcp::TcpSocket<'_>>,
+    effective_client_id: &str,
+    on_battery: &mut Option<bool>,
 ) {
-    'publishing: loop {
-        if !drain_queue(runtime, control, led, connection).await {
-            show_led_status(control, led, LedStatus::Fault).await;
-            break 'publishing;
-        }
+    control
+        .init(include_bytes!("../firmware/43439A0_clm.bin"))
+        .await;
+    control
+        .set_power_management(cyw43::PowerManagementMode::PowerSave)
+        .await;
+    let mut led = LedStatusModel::new();
+    show_led_status(control, &mut led, LedStatus::Idle).await;
+    *on_battery = with_timeout(Duration::from_secs(1), control.gpio_get(VBUS_SENSE_GPIO))
+        .await
+        .ok()
+        .flatten()
+        .map(|usb| !usb);
 
-        loop {
-            let utc_refresh_due = loop {
-                enum ConnectedEvent {
-                    SampleDue,
-                    MqttProgress,
-                    MqttFailed,
-                    UtcRefreshDue,
-                }
+    // With an existing UTC anchor, capture before any network operation so a
+    // network outage cannot prevent the scheduled measurement from being saved.
+    let had_clock = app.clock.is_some();
+    if had_clock {
+        capture_and_enqueue(app, control, &mut led).await;
+    }
+    connect_wifi(
+        control,
+        &mut led,
+        &app.stack,
+        app.config.wifi_ssid,
+        app.config.wifi_password,
+    )
+    .await;
 
-                let event = {
-                    // Keep the same MQTT poll future alive across LED ticks. Dropping and
-                    // recreating it every 100 ms needlessly cancels transport I/O.
-                    let mut mqtt_poll = pin!(connection.poll());
-                    loop {
-                        match select(
-                            select3(
-                                mqtt_poll.as_mut(),
-                                Timer::at(runtime.next_sample_at),
-                                Timer::at(runtime.clock.next_refresh_at),
-                            ),
-                            Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
-                        )
-                        .await
-                        {
-                            Either::First(Either3::First(Ok(Some(_publication)))) => {
-                                log::info!("received an unexpected MQTT publication while waiting");
-                                break ConnectedEvent::MqttProgress;
-                            }
-                            Either::First(Either3::First(Ok(None))) => {
-                                // Minimq made internal progress, such as keepalive traffic.
-                                break ConnectedEvent::MqttProgress;
-                            }
-                            Either::First(Either3::First(Err(error))) => {
-                                log::error!(
-                                    "MQTT session service failed while waiting for next sample: {:?}",
-                                    error
-                                );
-                                break ConnectedEvent::MqttFailed;
-                            }
-                            Either::First(Either3::Second(())) => {
-                                break ConnectedEvent::SampleDue;
-                            }
-                            Either::First(Either3::Third(())) => {
-                                break ConnectedEvent::UtcRefreshDue;
-                            }
-                            Either::Second(()) => {
-                                if led.status() == LedStatus::Fault {
-                                    tick_fault_led(control, led).await;
-                                }
-                            }
-                        }
-                    }
-                };
+    if !had_clock {
+        let anchor = synchronize_clock_until_ready(
+            app.stack,
+            app.config.ntp_host,
+            app.rng,
+            control,
+            &mut led,
+        )
+        .await;
+        *app.clock = Some(ClockState::new(anchor));
+        capture_and_enqueue(app, control, &mut led).await;
+    } else if let Some(clock) = app.clock.as_mut()
+        && power::now() >= clock.next_refresh_at
+    {
+        // Leave room in the overall awake budget for uploading even when NTP
+        // is unavailable. Retain the old anchor if this future is cancelled.
+        let _ = with_timeout(
+            Duration::from_secs(10),
+            refresh_clock(clock, app.stack, app.config.ntp_host, app.rng),
+        )
+        .await;
+    }
 
-                match event {
-                    ConnectedEvent::SampleDue => {
-                        capture_and_enqueue(runtime, control, led).await;
-                        break false;
-                    }
-                    ConnectedEvent::MqttProgress => {}
-                    ConnectedEvent::MqttFailed => break 'publishing,
-                    ConnectedEvent::UtcRefreshDue => {
-                        log::info!("UTC refresh deadline reached");
-                        break true;
-                    }
-                }
-            };
-
-            if !utc_refresh_due {
-                break;
-            }
-
-            if refresh_clock(
-                &mut runtime.clock,
-                runtime.stack,
-                runtime.config.ntp_host,
-                runtime.rng,
+    let mut backoff = RetryBackoff::new();
+    loop {
+        if !app.stack.is_link_up() || !app.stack.is_config_up() {
+            control.leave().await;
+            connect_wifi(
+                control,
+                &mut led,
+                &app.stack,
+                app.config.wifi_ssid,
+                app.config.wifi_password,
             )
-            .await
-            {
-                log::info!("scheduled UTC clock refresh succeeded");
-                show_led_status(control, led, LedStatus::Idle).await;
-            } else {
-                show_led_status(control, led, LedStatus::Fault).await;
-            }
+            .await;
         }
+        if upload_attempt(app, control, &mut led, effective_client_id).await {
+            show_led_status(control, &mut led, LedStatus::Idle).await;
+            log::info!("upload cycle complete");
+            return;
+        }
+        show_led_status(control, &mut led, LedStatus::Fault).await;
+        Timer::after_secs(backoff.next_delay_secs()).await;
     }
 }
 
-async fn run_supervisor(
-    supervisor: &mut Supervisor<'_>,
-    mqtt_session: &mut minimq::Session<'_>,
-    mqtt_rx_buffer: &mut [u8; MQTT_TCP_BUFFER_SIZE],
-    mqtt_tx_buffer: &mut [u8; MQTT_TCP_BUFFER_SIZE],
-) -> ! {
-    let Supervisor { app, control, led } = supervisor;
-    let mut reconnect_backoff = RetryBackoff::new();
-
-    // supervisor
-    loop {
-        let mut network_recovered = false;
-
-        if !app.stack.is_link_up() {
-            show_led_status(control, led, LedStatus::Fault).await;
-            log::info!("network link is down; clearing stale Wi-Fi association state");
-            control.leave().await;
-
-            log::info!("returning to Wi-Fi join");
-            recover_wifi_with_sampling(app, control, led).await;
-            network_recovered = true;
+async fn upload_attempt(
+    app: &mut AppRuntime<'_>,
+    control: &mut cyw43::Control<'_>,
+    led: &mut LedStatusModel,
+    effective_client_id: &str,
+) -> bool {
+    let address = match resolve_ipv4(app.stack, app.config.mqtt_host).await {
+        Ok(address) => address,
+        Err(error) => {
+            error.log(app.config.mqtt_host);
+            return false;
         }
-
-        if !app.stack.is_config_up() {
-            log::info!("network link is up; waiting for DHCP configuration");
-
-            match select3(
-                select(app.stack.wait_config_up(), app.stack.wait_link_down()),
-                Timer::at(app.next_sample_at),
-                Timer::after_millis(FAULT_FLASH_INTERVAL_MS),
-            )
-            .await
-            {
-                Either3::First(Either::First(())) => {
-                    log::info!("network configuration restored");
-                    network_recovered = true;
-                }
-                Either3::First(Either::Second(())) => {
-                    log::info!("network link dropped while waiting for DHCP");
-                    continue;
-                }
-                Either3::Second(()) => {
-                    capture_and_enqueue(app, control, led).await;
-                    show_led_status(control, led, LedStatus::Fault).await;
-                    continue;
-                }
-                Either3::Third(()) => {
-                    tick_fault_led(control, led).await;
-                    continue;
-                }
-            }
-        }
-
-        if network_recovered {
-            log::info!("network recovered; attempting UTC resynchronization");
-
-            if await_with_fault_flash(
-                refresh_clock(&mut app.clock, app.stack, app.config.ntp_host, app.rng),
-                control,
-                led,
-            )
-            .await
-            {
-                log::info!("UTC clock anchor refreshed after network recovery");
-            }
-        }
-
-        let endpoint = match await_with_fault_flash(
-            resolve_ipv4(app.stack, app.config.mqtt_host),
-            control,
-            led,
+    };
+    let mut rx = [0; MQTT_TCP_BUFFER_SIZE];
+    let mut tx = [0; MQTT_TCP_BUFFER_SIZE];
+    let mut packet_rx = [0; MQTT_PACKET_RX_BUFFER_SIZE];
+    let mut packet_tx = [0; MQTT_PACKET_TX_BUFFER_SIZE];
+    let mut socket = embassy_net::tcp::TcpSocket::new(app.stack, &mut rx, &mut tx);
+    socket.set_timeout(Some(Duration::from_secs(MQTT_CONNECTED_TCP_TIMEOUT_SECS)));
+    if !matches!(
+        with_timeout(
+            Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
+            socket.connect(embassy_net::IpEndpoint::new(address, app.config.mqtt_port))
         )
-        .await
-        {
-            Ok(address) => {
-                let endpoint = embassy_net::IpEndpoint::new(address, app.config.mqtt_port);
-
-                log::info!(
-                    "resolved MQTT endpoint: host={} endpoint={:?}",
-                    app.config.mqtt_host,
-                    endpoint
-                );
-
-                endpoint
-            }
-            Err(error) => {
-                error.log(app.config.mqtt_host);
-                show_led_status(control, led, LedStatus::Fault).await;
-
-                let retry_delay_secs = reconnect_backoff.next_delay_secs();
-
-                log::info!(
-                    "broker DNS unavailable; retrying in {} secs",
-                    retry_delay_secs
-                );
-
-                wait_with_sampling(app, control, led, Duration::from_secs(retry_delay_secs)).await;
-                continue;
-            }
-        };
-
-        let mut mqtt_socket =
-            embassy_net::tcp::TcpSocket::new(app.stack, mqtt_rx_buffer, mqtt_tx_buffer);
-
-        mqtt_socket.set_timeout(Some(Duration::from_secs(MQTT_TCP_TIMEOUT_SECS)));
-
-        log::info!("connecting to MQTT endpoint {:?}", endpoint);
-
-        match await_with_fault_flash(
-            with_timeout(
-                Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
-                mqtt_socket.connect(endpoint),
-            ),
-            control,
-            led,
-        )
-        .await
-        {
-            Ok(Ok(())) => {
-                log::info!(
-                    "MQTT TCP connected: local={:?} remote={:?}",
-                    mqtt_socket.local_endpoint(),
-                    mqtt_socket.remote_endpoint()
-                );
-
-                mqtt_socket.set_timeout(Some(Duration::from_secs(MQTT_CONNECTED_TCP_TIMEOUT_SECS)));
-                log::info!(
-                    "MQTT TCP receive-inactivity timeout set to {} seconds",
-                    MQTT_CONNECTED_TCP_TIMEOUT_SECS
-                );
-
-                match await_with_fault_flash(
-                    with_timeout(
-                        Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
-                        mqtt_session.connect(mqtt_socket),
-                    ),
-                    control,
-                    led,
-                )
-                .await
-                {
-                    Ok(Ok(mut connection)) => {
-                        log::info!("MQTT CONNACK accepted: {:?}", connection.connect_event());
-
-                        reconnect_backoff.reset();
-
-                        run_connected_session(app, control, led, &mut connection).await;
-                        log::error!(
-                            "MQTT connected session ended; dropping transport with queue depth {}",
-                            app.queue.depth()
-                        );
-                    }
-                    Ok(Err(error)) => {
-                        log::error!("MQTT session establishment failed: {:?}", error);
-                    }
-                    Err(_) => {
-                        log::error!(
-                            "MQTT session establishment timed out after {} seconds",
-                            MQTT_TCP_TIMEOUT_SECS
-                        );
-                    }
-                };
-            }
-            Ok(Err(error)) => {
-                log::error!("MQTT TCP connection failed: {:?}", error);
-            }
-            Err(_) => {
-                log::error!(
-                    "MQTT TCP connection timed out after {} seconds",
-                    MQTT_TCP_TIMEOUT_SECS
-                );
-            }
-        };
-
-        let retry_delay_secs = reconnect_backoff.next_delay_secs();
-        show_led_status(control, led, LedStatus::Fault).await;
-
-        log::info!(
-            "creating a fresh MQTT TCP socket in {} seconds",
-            retry_delay_secs
-        );
-
-        wait_with_sampling(app, control, led, Duration::from_secs(retry_delay_secs)).await;
+        .await,
+        Ok(Ok(()))
+    ) {
+        log::warn!("MQTT TCP connection failed or timed out");
+        return false;
     }
+    let Some(mut session) = create_mqtt_session(
+        app.config,
+        effective_client_id,
+        &mut packet_rx,
+        &mut packet_tx,
+    ) else {
+        return false;
+    };
+    let mut connection = match with_timeout(
+        Duration::from_secs(MQTT_TCP_TIMEOUT_SECS),
+        session.connect(socket),
+    )
+    .await
+    {
+        Ok(Ok(connection)) => connection,
+        _ => {
+            log::warn!("MQTT handshake failed or timed out");
+            return false;
+        }
+    };
+    let complete = drain_queue(app, control, led, &mut connection).await;
+    if complete {
+        // PUBACK already makes the queue durable; disconnect failure must not
+        // undo acknowledgments or extend the awake budget indefinitely.
+        let _ = with_timeout(Duration::from_secs(2), connection.disconnect()).await;
+    }
+    complete
 }
 
 #[embassy_executor::main(
@@ -1334,203 +1035,116 @@ async fn run_supervisor(
     entry = "cortex_m_rt::entry"
 )]
 async fn main(spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
-    let driver = Driver::new(p.USB, Irqs);
-
-    spawner.spawn(logger_task(driver).expect("Failed to start logger task"));
-
-    let hardware_chip_id = match embassy_rp::otp::get_chipid() {
-        Ok(chip_id) => chip_id,
-        Err(error) => {
-            log::error!("failed to read RP2350 hardware ID: {:?}", error);
-            loop {
-                Timer::after_secs(60).await;
-            }
-        }
-    };
-
+    let mut p = embassy_rp::init(Default::default());
+    let started_at = power::now();
+    let mut sleeper = power::Sleeper::new(p.POWMAN, Irqs);
+    spawner.spawn(logger_task(Driver::new(p.USB, Irqs)).expect("USB logger"));
+    let hardware_chip_id = embassy_rp::otp::get_chipid().expect("OTP chip ID");
+    let mut hardware_id_buffer = [0; 16];
+    let hardware_id = format_hardware_id(hardware_chip_id, &mut hardware_id_buffer);
+    let config = AppConfig::load().expect("application configuration");
+    let mut client_id_buffer = [0; MQTT_EFFECTIVE_CLIENT_ID_SIZE];
+    let client_id =
+        compose_mqtt_client_id(config.mqtt_client_id, hardware_id, &mut client_id_buffer)
+            .expect("MQTT client ID");
     let flash = Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
-    let (mut measurement_queue, recovery) =
-        match FlashQueue::recover(flash, STORAGE_OFFSET, STORAGE_LENGTH) {
-            Ok(value) => value,
-            Err(error) => {
-                log::error!("measurement queue recovery failed: {:?}", error);
-                loop {
-                    Timer::after_secs(60).await;
-                }
-            }
-        };
-
+    let (mut queue, recovery) = FlashQueue::recover(flash, STORAGE_OFFSET, STORAGE_LENGTH)
+        .expect("measurement queue recovery");
+    log::info!(
+        "queue recovered: depth={} corrupt={}",
+        recovery.depth,
+        recovery.corrupt_records
+    );
     let mut i2c_config = I2cConfig::default();
-    i2c_config.frequency = 100_000; // 100 kHz
+    i2c_config.frequency = 100_000;
     i2c_config.sda_pullup = true;
     i2c_config.scl_pullup = true;
-
-    let i2c = I2c::new_async(
-        p.I2C0, p.PIN_1, // SCL
-        p.PIN_0, // SDA
-        Irqs, i2c_config,
-    );
-
-    let mut sht40: Sensor = Sht4xAsync::new(i2c);
+    let mut sensor = Sht4xAsync::new(I2c::new_async(p.I2C0, p.PIN_1, p.PIN_0, Irqs, i2c_config));
     let mut delay = Delay;
-
-    let fw = aligned_bytes!("../firmware/43439A0.bin");
-    let clm = aligned_bytes!("../firmware/43439A0_clm.bin");
-    let nvram = aligned_bytes!("../firmware/nvram_rp2040.bin");
-
-    let pwr = Output::new(p.PIN_23, Level::Low);
-    let cs = Output::new(p.PIN_25, Level::High);
-
-    let mut pio = Pio::new(p.PIO0, Irqs);
-
-    let spi = PioSpi::new(
-        &mut pio.common,
-        pio.sm0,
-        DEFAULT_CLOCK_DIVIDER,
-        pio.irq0,
-        cs,
-        p.PIN_24,
-        p.PIN_29,
-        dma::Channel::new(p.DMA_CH0, Irqs),
-    );
-
-    let spi = voltage::VoltageSpi::new(spi, p.ADC);
-
-    static CYW43_STATE: StaticCell<cyw43::State> = StaticCell::new();
-    static NETWORK_RESOURCES: StaticCell<embassy_net::StackResources<4>> = StaticCell::new();
-
-    let state = CYW43_STATE.init(cyw43::State::new());
-
-    let (net_device, mut control, runner) = cyw43::new(state, pwr, spi, fw, nvram).await;
-    let mut rng = embassy_rp::clocks::RoscRng;
-    let seed = rng.next_u64();
-
-    let net_config = embassy_net::Config::dhcpv4(Default::default());
-
-    let (stack, net_runner) = embassy_net::new(
-        net_device,
-        net_config,
-        NETWORK_RESOURCES.init(embassy_net::StackResources::new()),
-        seed,
-    );
-
-    spawner.spawn(cyw43_task(runner).expect("Failed to start CYW43 runner task"));
-    spawner.spawn(net_task(net_runner).expect("Failed to start network runner task"));
-
-    control.init(clm).await;
-
-    control
-        .set_power_management(cyw43::PowerManagementMode::PowerSave)
-        .await;
-
-    log::info!("radio ready: CYW43439 initialized in PowerSave mode");
-    let mut led = LedStatusModel::new();
-    // Startup is not yet a healthy idle state. Flash until the first sample
-    // attempt takes priority and a broker acknowledgment can establish Idle.
-    show_led_status(&mut control, &mut led, LedStatus::Fault).await;
-
-    let started_at = Instant::now();
-
-    flash_fault_for(&mut control, &mut led, Duration::from_secs(2)).await;
-
-    log::info!("Pico Data Logger v{} starting", env!("CARGO_PKG_VERSION"));
+    let mut rng = RoscRng;
     log::info!(
-        "measurement queue recovered: depth={} corrupt={} next_sequence={} capacity={}",
-        recovery.depth,
-        recovery.corrupt_records,
-        recovery.next_sequence,
-        measurement_queue.capacity()
-    );
-
-    if !await_with_fault_flash(check_sensor(&mut sht40, &mut delay), &mut control, &mut led).await {
-        show_led_status(&mut control, &mut led, LedStatus::Fault).await;
-    }
-
-    let config = match AppConfig::load() {
-        Ok(config) => config,
-        Err(error) => {
-            log::error!("invalid application configuration: {:?}", error);
-            flash_fault_forever(&mut control, &mut led).await;
-        }
-    };
-    let mut hardware_id_buffer = [0_u8; 16];
-    let hardware_id = format_hardware_id(hardware_chip_id, &mut hardware_id_buffer);
-    let mut effective_client_id_buffer = [0_u8; MQTT_EFFECTIVE_CLIENT_ID_SIZE];
-    let effective_client_id = match compose_mqtt_client_id(
+        "Pico Data Logger v{}: device={} hardware={} interval={}s awake_budget={}s",
+        env!("CARGO_PKG_VERSION"),
         config.mqtt_client_id,
         hardware_id,
-        &mut effective_client_id_buffer,
-    ) {
-        Ok(client_id) => client_id,
-        Err(error) => {
-            log::error!("failed to compose unique MQTT client ID: {:?}", error);
-            flash_fault_forever(&mut control, &mut led).await;
-        }
-    };
-    log::info!(
-        "device identity ready: device_id={} hardware_id={} mqtt_client_id={}",
-        config.mqtt_client_id,
-        hardware_id,
-        effective_client_id
+        PUBLISH_INTERVAL_SECS,
+        AWAKE_BUDGET_SECS
     );
-
-    connect_wifi(
-        &mut control,
-        &mut led,
-        &stack,
-        config.wifi_ssid,
-        config.wifi_password,
-    )
-    .await;
-
-    let clock_anchor =
-        synchronize_clock_until_ready(stack, config.ntp_host, &mut rng, &mut control, &mut led)
+    let mut clock = None;
+    let mut radio_power = Output::new(p.PIN_23, Level::Low);
+    let mut next_cycle = power::now();
+    loop {
+        let mut on_battery = None;
+        let cycle = async {
+            let mut pio = Pio::new(p.PIO0.reborrow(), Irqs);
+            let cs = Output::new(p.PIN_25.reborrow(), Level::High);
+            let spi = PioSpi::new(
+                &mut pio.common,
+                pio.sm0,
+                DEFAULT_CLOCK_DIVIDER,
+                pio.irq0,
+                cs,
+                p.PIN_24.reborrow(),
+                p.PIN_29.reborrow(),
+                dma::Channel::new(p.DMA_CH0.reborrow(), Irqs),
+            );
+            let spi = voltage::VoltageSpi::new(spi, p.ADC.reborrow());
+            let mut state = cyw43::State::new();
+            let (device, mut control, runner) = cyw43::new(
+                &mut state,
+                &mut radio_power,
+                spi,
+                aligned_bytes!("../firmware/43439A0.bin"),
+                aligned_bytes!("../firmware/nvram_rp2040.bin"),
+            )
             .await;
-    let clock = ClockState::new(clock_anchor);
-
-    let mut mqtt_rx_buffer = [0_u8; MQTT_TCP_BUFFER_SIZE];
-    let mut mqtt_tx_buffer = [0_u8; MQTT_TCP_BUFFER_SIZE];
-    let mut mqtt_packet_rx_buffer = [0_u8; MQTT_PACKET_RX_BUFFER_SIZE];
-    let mut mqtt_packet_tx_buffer = [0_u8; MQTT_PACKET_TX_BUFFER_SIZE];
-
-    let mut reading_json_buffer = [0_u8; READING_JSON_BUFFER_SIZE];
-
-    let mqtt_session = create_mqtt_session(
-        &config,
-        effective_client_id,
-        &mut mqtt_packet_rx_buffer,
-        &mut mqtt_packet_tx_buffer,
-    );
-
-    let Some(mut mqtt_session) = mqtt_session else {
-        log::error!("MQTT configuration unavailable; supervisor cannot start");
-        flash_fault_forever(&mut control, &mut led).await;
-    };
-
-    let mut supervisor = Supervisor {
-        app: AppRuntime {
-            config: &config,
-            stack,
-            rng: &mut rng,
-            sensor: &mut sht40,
-            delay: &mut delay,
-            started_at,
-            clock,
-            reading_json_buffer: &mut reading_json_buffer,
-            hardware_id,
-            queue: &mut measurement_queue,
-            next_sample_at: Instant::now(),
-        },
-        control: &mut control,
-        led,
-    };
-
-    run_supervisor(
-        &mut supervisor,
-        &mut mqtt_session,
-        &mut mqtt_rx_buffer,
-        &mut mqtt_tx_buffer,
-    )
-    .await
+            let mut resources = embassy_net::StackResources::<4>::new();
+            let (stack, mut net_runner) = embassy_net::new(
+                device,
+                embassy_net::Config::dhcpv4(Default::default()),
+                &mut resources,
+                rng.next_u64(),
+            );
+            let mut json = [0; READING_JSON_BUFFER_SIZE];
+            let mut app = AppRuntime {
+                config: &config,
+                stack,
+                rng: &mut rng,
+                sensor: &mut sensor,
+                delay: &mut delay,
+                started_at,
+                clock: &mut clock,
+                reading_json_buffer: &mut json,
+                hardware_id,
+                queue: &mut queue,
+            };
+            select3(
+                upload_cycle(&mut app, &mut control, client_id, &mut on_battery),
+                runner.run(),
+                net_runner.run(),
+            )
+            .await;
+        };
+        let result = with_timeout(Duration::from_secs(AWAKE_BUDGET_SECS), cycle).await;
+        // All cycle futures and hardware drivers have now been dropped. DMA
+        // cancellation and PIO teardown happen before asserting radio reset.
+        radio_power.set_low();
+        if result.is_err() {
+            log::warn!("awake budget exhausted; queued readings retained");
+        }
+        next_cycle = Instant::from_millis(pico_data_logger::schedule::next_deadline_ms(
+            next_cycle.as_millis(),
+            power::now().as_millis(),
+            PUBLISH_INTERVAL_SECS * 1000,
+        ));
+        log::info!(
+            "cycle ended: queue={} battery={:?}; sleeping until uptime={}s",
+            queue.depth(),
+            on_battery,
+            (next_cycle - started_at).as_secs()
+        );
+        sleeper
+            .wait_until(next_cycle, on_battery == Some(true))
+            .await;
+    }
 }

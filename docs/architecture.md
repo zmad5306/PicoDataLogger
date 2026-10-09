@@ -46,20 +46,15 @@ The linker divides the Pico 2 W's 4 MiB external flash into two non-overlapping 
 
 The measurement-storage region occupies the final 64 4-KiB erase sectors. Its start and size are erase-aligned so queue code can erase sectors without touching firmware bytes. `memory.x` fails the link if the firmware image reaches the reserved region and exports `__storage_start` and `__storage_end` for the flash driver integration.
 
-Each append-only record occupies one 256-byte page. Version 2 adds the VSYS voltage captured with the sensor measurement; version 1 records remain readable with an unavailable (`null`) voltage. Version 3 adds an optional `on_battery` flag in a checksummed reserved byte; versions 1 and 2 decode that flag as unknown. A CRC-32 protects its versioned contents, and a commit marker is written last so recovery can reject interrupted writes. Acknowledgment clears another state bit after MQTT PUBACK. The queue keeps one sector as circular working space, batches erases by 16 records, and reconstructs ordering by sequence number after reboot. Its usable capacity is 1,008 readings, or 16 hours and 48 minutes at the 60-second interval.
+Each append-only record occupies one 256-byte page. Version 2 adds the VSYS voltage captured with the sensor measurement; version 1 records remain readable with an unavailable (`null`) voltage. Version 3 adds an optional `on_battery` flag in a checksummed reserved byte; versions 1 and 2 decode that flag as unknown. A CRC-32 protects its versioned contents, and a commit marker is written last so recovery can reject interrupted writes. Acknowledgment clears another state bit after MQTT PUBACK. The queue keeps one sector as circular working space, batches erases by 16 records, and reconstructs ordering by sequence number after reboot. Its usable capacity is 1,008 readings, or 10 days and 12 hours at the 15-minute interval.
 
 ## Runtime tasks
 
-Four long-lived async execution paths cooperate on the Embassy executor:
+USB logging is the only independently spawned long-lived task. Each wake cycle constructs fresh CYW43439 state, PIO/SPI/DMA and ADC drivers, network resources, DHCP state, and MQTT sessions. `select3` polls the application and both driver runners concurrently. The entire scope, including radio initialization, is wrapped in a 60-second timeout.
 
-| Execution path | Responsibility |
-| --- | --- |
-| USB logger task | Runs USB CDC logging independently of application recovery. |
-| CYW43439 runner | Services communication with the Wi-Fi radio. |
-| `embassy-net` runner | Drives DHCP, DNS, UDP, and TCP network progress. |
-| Main application | Owns the SHT40, clock anchor, MQTT session, fixed buffers, sampling schedule, and recovery supervisor. |
+On success or timeout, the scope drops pending transfers and drivers before GP23 is driven low to power down the radio. Rust peripheral reborrows ensure the next cycle cannot create drivers until the previous owners are gone. The sensor, flash queue, UTC anchor, and scheduler remain alive across cycles. Voltage request/response signals are reset for each new radio scope.
 
-The logger and network runners are spawned before the main application begins joining Wi-Fi. A failed sensor read, NTP request, or MQTT connection therefore does not intentionally stop USB diagnostics or the lower-level network drivers.
+Battery operation then enters clock-gated SLEEP with both PLLs stopped and only the POWMAN reference clock enabled in the sleep clock masks. The crystal-clocked AON timer supplies the wake interrupt. Other NVIC interrupts are temporarily masked, and clocks and masks are restored before any handler or task resumes. USB-powered or unknown-power operation uses an async wait instead. SRAM and oscillators remain powered; this is not DORMANT or a full power-domain shutdown.
 
 ## Hardware connections
 
@@ -112,7 +107,7 @@ MQTT publications use QoS 1 and are not retained. Each payload carries the confi
 
 ## Time model
 
-Embassy's `Instant` is monotonic: it measures elapsed time but has no relationship to a calendar epoch. NTP supplies whole UTC seconds, which the firmware stores beside `Instant::now()` as a clock anchor:
+Embassy's `Instant` stops during clock-gated sleep. `power::now()` adds AON-measured elapsed sleep, excluding entry/exit time already counted by Embassy. NTP supplies whole UTC seconds, stored beside this application clock as an anchor:
 
 ```text
 current Unix time = anchored Unix time + monotonic elapsed seconds
@@ -120,7 +115,7 @@ current Unix time = anchored Unix time + monotonic elapsed seconds
 
 The firmware validates the NTP packet before accepting its timestamp, including its length, server mode, leap indicator, stratum, and request/originate timestamp relationship. Checked arithmetic rejects timestamps before the Unix epoch and detects anchor overflow.
 
-Startup does not proceed to MQTT until the first valid anchor exists. Later refresh failures retain the last valid anchor rather than replacing UTC with uptime. Refresh occurs after network recovery and at least daily; failures retry with bounded backoff.
+Startup does not proceed to MQTT until the first valid anchor exists. Later refresh failures retain the last valid anchor rather than replacing UTC with uptime. Refresh is attempted when due, normally daily, with a 10-second limit within the overall awake budget. On failure the existing anchor remains valid and refresh is retried in a later cycle. Network timeout futures use only the native awake clock. Application scheduling and uptime use the sleep-aware clock.
 
 ## Fixed memory and ownership
 
@@ -138,39 +133,28 @@ The firmware reuses fixed-size storage instead of allocating per operation:
 
 Rust ownership keeps those buffers from being reused while an async operation still borrows them. The JSON encoder returns a slice whose lifetime is tied to the caller's buffer, preventing that slice from outliving its storage. Encoding and clock arithmetic return explicit errors rather than panicking on undersized storage or overflow.
 
-## Recovery supervisor
-
-After configuration and initial UTC synchronization, the main application runs a forever supervisor:
+## Bounded upload cycles
 
 ```mermaid
 flowchart TD
-    READY{"Wi-Fi link and DHCP ready?"}
-    JOIN["Clear stale association<br/>join Wi-Fi<br/>wait for DHCP"]
-    TIME["Refresh UTC after recovery"]
-    DNS["Resolve broker"]
-    TCP["Create fresh TCP socket"]
-    MQTT["Create MQTT connection"]
-    RUN["Measure, publish, and service MQTT"]
-    WAIT["Bounded retry delay"]
-
-    READY -->|No| JOIN --> TIME --> DNS
-    READY -->|Yes| DNS
-    DNS -->|Success| TCP -->|Success| MQTT -->|Success| RUN
-    DNS -->|Failure| WAIT
-    TCP -->|Failure| WAIT
-    MQTT -->|Failure| WAIT
-    RUN -->|Transport or broker failure| WAIT
-    WAIT --> READY
+    WAKE[Wake and initialize radio] --> CLOCK{UTC anchor available?}
+    CLOCK -->|Yes| SAMPLE[Capture and persist reading]
+    SAMPLE --> JOIN[Join Wi-Fi and DHCP]
+    CLOCK -->|No| FIRST[Join Wi-Fi, DHCP and NTP]
+    FIRST --> SAMPLEFIRST[Capture first timestamped reading]
+    SAMPLEFIRST --> UPLOAD[Publish oldest-first until PUBACK]
+    JOIN --> UPLOAD
+    UPLOAD -->|Success| STOP[Drop drivers and power down radio]
+    WAKE -. 60-second overall deadline .-> STOP
+    UPLOAD -->|Failure within budget| RETRY[Back off and reconnect]
+    RETRY --> UPLOAD
+    STOP --> SLEEP[Wait until next 15-minute slot]
+    SLEEP --> WAKE
 ```
 
-Recovery follows the failed layer:
+The deadline also covers join, DHCP, DNS, first-boot NTP, and backlog draining. Unacknowledged records remain in flash. Samples are taken before connection attempts once a UTC anchor exists. A cold boot without NTP skips new samples instead of substituting uptime for UTC. A large backlog may require multiple cycles to drain. Missed schedule slots are skipped; successful uploads do not shift the schedule by their connection duration.
 
-- A sensor error skips one sample but preserves a healthy MQTT connection.
-- DNS, TCP, MQTT handshake, publish, keepalive, or disconnect failures discard the MQTT connection and TCP socket. Publish submission and PUBACK waits are bounded to 15 seconds, and a connected TCP socket is bounded by a 120-second receive-inactivity timeout. Timed-out QoS 1 records remain in flash for replay. The next attempt re-resolves DNS and creates fresh transport state.
-- Link loss clears stale CYW43439 association state, rejoins Wi-Fi with a bounded attempt, waits for DHCP, and then rebuilds time and broker state. Startup also bounds DHCP acquisition to 30 seconds and rejoins Wi-Fi after a timeout.
-- MQTT reconnection and UTC refresh delays grow through 1, 2, 4, 8, 16, 32, and 60 seconds, then remain capped. Successful recovery resets the applicable backoff.
-
-Only invalid compile-time application configuration reaches the deliberate parked diagnostic state. Runtime network and service failures continue retrying.
+See [battery-cycle.md](battery-cycle.md) for a code walkthrough and hardware checks.
 
 ## Verification boundary
 

@@ -2,12 +2,12 @@
 
 Bare-metal Rust firmware that reads temperature and humidity from an SHT40, assigns synchronized UTC timestamps, and publishes JSON readings over MQTT from a Raspberry Pi Pico 2 W.
 
-The firmware is designed to run unattended: it services MQTT between samples, retries transient failures indefinitely with bounded delays, rebuilds stale network state at the appropriate layer, and keeps USB diagnostics active during recovery.
+The firmware takes a reading on a 15-minute schedule. Each wake cycle has a 60-second budget for radio initialization, sampling, connecting, and uploading. It saves readings to flash before uploading, powers down the radio after each cycle, and uses clock-gated RP2350 SLEEP on battery power. USB-powered operation keeps diagnostics responsive between cycles.
 
 Project documentation:
 
 - This README is the build, deployment, operation, troubleshooting, and acceptance-test runbook.
-- [Architecture](docs/architecture.md) explains the async tasks, hardware interfaces, protocol layers, fixed-memory model, clock anchor, and recovery supervisor.
+- [Architecture](docs/architecture.md) explains the async tasks, hardware interfaces, protocol layers, fixed-memory model, clock anchor, and bounded upload cycles.
 - [CYW43439 firmware provenance](firmware/README.md) records the bundled radio firmware source and hashes.
 
 ## Hardware
@@ -33,7 +33,9 @@ The I2C data and clock lines use GP0 and GP1, respectively.
 
 ### Wireless power management
 
-The firmware explicitly configures the CYW43439 to use Embassy's `PowerSave` mode. This provides a balanced default for a continuously running data logger: the radio conserves power while remaining responsive enough for periodic network and MQTT activity.
+The CYW43439 uses Embassy's `PowerSave` mode while awake and is held in reset/power-down through GP23 between cycles. On confirmed battery power, both PLLs and peripheral clocks are stopped/gated during RP2350 SLEEP; a crystal-clocked always-on timer wakes the processor. SRAM and the crystal remain powered: this is clock-gated SLEEP, not DORMANT or complete power-domain shutdown. The SHT40 remains on the documented 3V3 rail, including its power LED.
+
+On USB power, or if VBUS sensing fails, the radio still powers down but the CPU uses an ordinary async wait to preserve USB diagnostics. Connecting USB during battery sleep does not immediately wake the firmware; allow the next scheduled wake. Actual current and repeated wakeup reliability require hardware verification. See [Battery cycle implementation and validation](docs/battery-cycle.md).
 
 ## Build and deploy
 
@@ -230,7 +232,7 @@ Copy the UF2 to the mounted bootloader volume:
 cp pico-data-logger.uf2 /Volumes/RP2350/
 ```
 
-After accepting the complete UF2, the ROM bootloader writes the application to external flash and automatically reboots. `/Volumes/RP2350` should disappear within a few seconds. Once the CYW43439 is initialized, the onboard LED enters its rapid-flash startup state until the first sample attempt takes priority.
+After accepting the complete UF2, the ROM bootloader writes the application to external flash and automatically reboots. `/Volumes/RP2350` should disappear within a few seconds. Each wake initializes the CYW43439; the onboard LED indicates sampling and connection activity during that cycle, then goes out when the radio powers down.
 
 ### 5. Connect to USB serial
 
@@ -277,7 +279,7 @@ Reconnect with the newly reported device instead of reusing a stale name from an
 
 ## Runtime architecture
 
-The firmware uses independently scheduled Embassy tasks for USB logging, the CYW43439 radio, and the network stack. The main application owns the SHT40, time synchronization, MQTT session, and recovery supervisor. A blocked or failed network operation therefore does not intentionally stop USB diagnostics or the network driver tasks. See the [architecture document](docs/architecture.md) for the detailed task, protocol, ownership, and recovery design.
+USB logging runs in a separate Embassy task. During each wake cycle, the application, CYW43439 runner, and network runner are polled together within one cancellable scope. Its 60-second deadline includes radio initialization and network recovery. All network drivers are dropped before radio power-down. See the [architecture document](docs/architecture.md) for ownership and recovery details.
 
 The data path is:
 
@@ -296,19 +298,18 @@ The application does not allocate a new JSON or network buffer for every reading
 
 ## Normal operation
 
-At boot the firmware:
+At boot the firmware starts USB logging, opens the sensor, reads the hardware ID, and recovers the flash queue. It then repeats this cycle on a 15-minute schedule:
 
-1. Starts USB logging and the radio/network tasks.
-2. Reads the SHT40 serial number.
-3. Joins the configured Wi-Fi network and waits for DHCP.
-4. Resolves the NTP host and waits until it obtains a valid UTC clock anchor.
-5. Resolves the MQTT broker, opens TCP, and establishes the MQTT session.
-6. Recovers the flash-backed measurement queue, then measures once every 60 seconds whether or not MQTT is available.
-7. Publishes queued measurements oldest-first with MQTT QoS 1, removing each record only after its PUBACK arrives.
+1. Initialize the radio and fresh DHCP/network state, and sense whether USB power is present.
+2. If a UTC anchor already exists, capture and persist a reading before attempting Wi-Fi, so ordinary network outages do not prevent sampling.
+3. Join Wi-Fi and obtain DHCP. On the first successful boot synchronization, obtain UTC with NTP before capturing the first reading. Until then, skip samples rather than invent timestamps.
+4. Refresh an existing UTC anchor when due (daily), allowing at most 10 seconds of the cycle for refresh; retain the old anchor on failure.
+5. Connect to MQTT and publish queued records oldest-first with QoS 1. Retire each only after PUBACK.
+6. After success or the 60-second awake deadline, drop all network futures/drivers and power down the radio. Sleep until the next scheduled cycle.
 
-Each reading is timestamped when the measurement is captured, before JSON encoding and network delivery. The firmware publishes both absolute UTC and uptime because they answer different questions: UTC identifies when the measurement occurred, while uptime helps identify reboots and how long the current run has lasted.
+The schedule is measured from cycle starts, so upload time does not add another 15 minutes. Missed slots are skipped rather than sampled in a burst. Radio initialization and first-boot NTP can delay the actual capture within a slot. An initial NTP outage produces no samples until a valid anchor exists. After an ordinary reboot that anchor must be obtained again; already queued records retain their original timestamps.
 
-The UTC anchor is refreshed after network recovery and at least once per day. A failed refresh does not replace a valid anchor with uptime; it retains the last valid anchor and retries with bounded backoff.
+Application UTC and `uptime_s` include sleep duration measured by the always-on timer. Network timeouts use Embassy's native awake-time clock. USB-powered cycles retain the same sampling schedule and radio power-down behavior, using an async wait instead of clock-gated sleep.
 
 ### Observe MQTT readings
 
@@ -371,22 +372,21 @@ Hardware acceptance: observe MQTT while running from batteries, compare `vsys_vo
 
 ### Offline queue capacity and wear
 
-The final 256 KiB of onboard flash is reserved for measurements and excluded from the firmware link region. Records occupy one 256-byte flash page and include a format version, sequence number, original Unix timestamp, temperature, humidity, uptime, VSYS voltage, power-source flag, and CRC-32 integrity check. One 4-KiB erase sector is retained as circular working space, leaving 1,008 usable records—16 hours and 48 minutes at one reading per minute.
+The final 256 KiB of onboard flash is reserved for measurements and excluded from the firmware link region. Records occupy one 256-byte flash page and include a format version, sequence number, original Unix timestamp, temperature, humidity, uptime, VSYS voltage, power-source flag, and CRC-32 integrity check. One 4-KiB erase sector is retained as circular working space, leaving 1,008 usable records—10 days and 12 hours at one reading every 15 minutes.
 
 Writes are append-only. A record becomes visible only after its body and checksum have been written and a final commit byte is programmed. Recovery ignores incomplete or corrupt records and reconstructs FIFO order from sequence numbers. Acknowledgment and commit markers only clear flash bits; sectors are erased in 16-record batches instead of once per measurement. When all 1,008 positions are occupied, the oldest measurement is explicitly discarded so newer outage data continues to be captured.
 
 ## Recovery behavior
 
-The application is supervised indefinitely rather than stopping after a fixed number of attempts. MQTT reconnection and UTC-refresh retries use delays of 1, 2, 4, 8, 16, 32, and then at most 60 seconds. Successful recovery resets the applicable backoff. Wi-Fi join attempts have a 15-second timeout and retry after five seconds.
+Recovery runs only within the current 60-second awake budget. MQTT attempts use increasing retry delays, fresh sessions, and fresh sockets. Wi-Fi joins retain their 15-second timeout and DHCP its 30-second timeout, all subordinate to the overall deadline.
 
-Recovery discards state from the failed layer upward:
+- A failed sensor read skips this cycle's sample; queued records can still upload.
+- A Wi-Fi or broker outage leaves the captured record in flash. The next attempt is in a later wake cycle if the current budget expires.
+- A timed-out QoS 1 publication remains queued unless PUBACK has already been processed and the record retired. Power loss between broker receipt and retirement may cause duplicate replay.
+- A failed NTP refresh retains the existing anchor. A cold boot without NTP cannot timestamp new samples and retries next cycle.
+- Radio initialization or sensor/driver stalls are also covered by the async deadline, provided the driver yields. A synchronous hardware hang or panic is not a watchdog-protected failure.
 
-- A failed SHT40 read skips one publication and retries at the next 60-second sample without dropping a healthy MQTT session.
-- A broker DNS, TCP, MQTT handshake, publish, keepalive, or disconnect failure drops the MQTT connection and TCP socket while the 60-second sampler continues appending timestamped readings to flash. MQTT publish submission and PUBACK waits each have a 15-second deadline, and connected sockets have a 120-second receive-inactivity timeout. The next attempt resolves the broker again, creates fresh transport state, and replays the backlog before newly captured readings.
-- A lost Wi-Fi link explicitly clears stale CYW43439 association state, then returns to Wi-Fi join and DHCP before DNS, NTP, TCP, and MQTT are rebuilt. Startup DHCP waits are bounded to 30 seconds; a timeout leaves the association and retries from Wi-Fi join instead of hanging indefinitely.
-- A UTC refresh failure retains the last valid clock anchor and retries with the same bounded-backoff policy. A successful refresh resets that backoff and schedules the next daily refresh.
-
-The USB logger remains a separate task throughout these paths, so the serial log should continue reporting recovery transitions while the application waits.
+The logger remains available throughout awake work and USB-powered waits. It cannot run during battery sleep.
 
 ### Onboard status LED
 
@@ -394,40 +394,40 @@ The Pico 2 W onboard LED is wired to the CYW43439 radio module's `WL_GPIO0`, not
 
 | Pattern | Meaning |
 | --- | --- |
-| Off | Healthy waiting between samples after a broker-acknowledged publication |
-| Solid on | A sample is being measured, converted, queued, encoded, or submitted to MQTT |
-| Rapid flash (100 ms on / 100 ms off) | A sensor, conversion, storage, configuration, Wi-Fi, DNS, NTP, TCP, or MQTT fault is being reported or recovered |
+| Off | Idle, or radio powered down between cycles (including after a failed cycle) |
+| Solid on | Sampling or publishing |
+| Flashing | Wi-Fi/NTP recovery while awake; other retries may show a steady fault phase |
 
-Startup uses the rapid-flash state because the logger has not yet completed a publish cycle. The firmware keeps advancing the 100 ms flash phase while it awaits Wi-Fi association, network link, DHCP, DNS, NTP, TCP, and MQTT setup. Non-radio futures stay pinned and are not restarted on each LED tick. Wi-Fi association uses the repository's narrowly patched `cyw43::Control::join_with_gpio_flash`, which services `WL_GPIO0` inside the driver's association-event loop because `Control::join` otherwise holds the only control handle. A new sample attempt temporarily changes the indication to solid on. A failure returns it to rapid flashing. With the current QoS 1 queue, the LED returns to off only after the broker's PUBACK is received and the corresponding flash record is retired. PUBACK confirms broker receipt, but it does not prove that any subscriber processed the reading.
+The LED cannot signal an outage while the radio is powered down. Use recent MQTT capture timestamps and a server-side last-seen alert. PUBACK confirms broker receipt, not subscriber processing.
 
 ## Recovery troubleshooting and acceptance checks
 
-Keep the USB serial monitor and MQTT subscriber visible during each check. Do not reset the Pico while testing recovery.
+Use USB power and keep the serial monitor and MQTT subscriber visible for these recovery checks. Do not reset except where explicitly requested. USB checks do not verify battery sleep; follow the separate [battery acceptance procedure](docs/battery-cycle.md#hardware-acceptance).
 
 ### Sensor interruption
 
-1. Confirm readings are arriving every 60 seconds; the LED is off while waiting, solid during a sample, and off again after its publication is acknowledged.
-2. Disconnect the SHT40, wait for a sample, and confirm an I2C failure is logged and the LED rapidly flashes without a reboot.
+1. Confirm readings are arriving approximately every 15 minutes; the LED is off while waiting, solid during a sample, and off again after its publication is acknowledged.
+2. Disconnect the SHT40, wait for a sample, and confirm an I2C failure is logged without a reboot.
 3. Reconnect the sensor using 3V3, GND, GP0/SDA, and GP1/SCL.
 4. Confirm a later sample is published, the LED returns to off after PUBACK, and `uptime_s` continues increasing.
 
 ### Broker outage
 
 1. Subscribe to the readings topic and note the latest `sequence` and `timestamp_unix_s`.
-2. Block broker access for at least three 60-second sample intervals and confirm serial queue depth grows while the LED rapidly flashes between solid sample attempts.
+2. Block broker access for at least three 15-minute sample intervals and confirm serial queue depth grows across wake cycles.
 3. Power-cycle the Pico while broker access remains blocked; confirm recovery logs the preserved queue depth.
 4. Restore broker access and observe the queued timestamps arrive in ascending sequence order before normal live publishing resumes; confirm the LED returns to off after the backlog is acknowledged.
 5. Confirm any duplicate carries the same sequence number and that recovery requires no manual reset.
 
-If the broker repeatedly reports a timeout, confirm the firmware services the MQTT connection between samples and that its keepalive is not being blocked by a firewall or container networking rule.
+The MQTT connection intentionally closes between cycles. A failure to send a graceful DISCONNECT may leave the old broker session visible until its keepalive expires; it is not maintained during sleep.
 
-The USB log distinguishes `publish submission timed out`, `PUBACK timed out`, MQTT session-service failures, and TCP connection failures. Publish-timeout messages include the affected sequence number and current queue depth; the record remains queued for replay after reconnection.
+The USB log distinguishes `publish submission timed out`, `PUBACK timed out`, awake-budget exhaustion, and TCP connection failures. Publish-timeout messages include the affected sequence number and current queue depth; the record remains queued for replay after reconnection.
 
 ### Wi-Fi interruption
 
 1. Interrupt the configured Wi-Fi network long enough for the Pico to detect link loss.
 2. Restore the network.
-3. Confirm the log returns through Wi-Fi join, DHCP, UTC refresh, broker DNS, TCP, and MQTT.
+3. At the next scheduled cycle, confirm Wi-Fi join, DHCP, broker DNS, TCP, and MQTT recover; UTC refresh occurs only when due.
 4. Confirm publications resume and `uptime_s` did not restart.
 
 ### NTP unavailable at boot
@@ -435,7 +435,7 @@ The USB log distinguishes `publish submission timed out`, `PUBACK timed out`, MQ
 1. Make the configured NTP service unreachable before booting the Pico.
 2. Confirm the firmware reports that time remains unsynchronized and does not publish readings with uptime substituted for UTC.
 3. Restore NTP reachability.
-4. Confirm synchronization succeeds and normal MQTT publishing begins without resetting the Pico.
+4. At the next scheduled cycle, confirm synchronization succeeds and MQTT publishing begins without resetting the Pico.
 
 ### Common network failures
 

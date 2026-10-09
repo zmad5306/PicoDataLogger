@@ -29,13 +29,15 @@ pub async fn read_voltage() -> Option<f32> {
     }
 }
 
-pub struct VoltageSpi {
-    spi: PioSpi<'static, PIO0, 0>,
-    adc: Adc<'static, Blocking>,
+pub struct VoltageSpi<'d> {
+    spi: PioSpi<'d, PIO0, 0>,
+    adc: Adc<'d, Blocking>,
 }
 
-impl VoltageSpi {
-    pub fn new(spi: PioSpi<'static, PIO0, 0>, adc: Peri<'static, ADC>) -> Self {
+impl<'d> VoltageSpi<'d> {
+    pub fn new(spi: PioSpi<'d, PIO0, 0>, adc: Peri<'d, ADC>) -> Self {
+        REQUEST.reset();
+        RESPONSE.reset();
         Self {
             spi,
             adc: Adc::new_blocking(adc, Config::default()),
@@ -77,7 +79,7 @@ impl VoltageSpi {
     }
 }
 
-impl SpiBusCyw43 for VoltageSpi {
+impl SpiBusCyw43 for VoltageSpi<'_> {
     async fn cmd_write(&mut self, write: &[u32]) -> u32 {
         self.service_request();
         self.spi.cmd_write(write).await
